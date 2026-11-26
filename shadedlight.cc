@@ -833,11 +833,29 @@ void Shaded_light::dump(Image_window8& win, int number, bool view, bool full) {
 	// pixels rebuilt into world positions, which should lie in its box.
 	long  faces[8] = {};
 	long  avatar_px = 0, avatar_clamped = 0;
+	long  box_px = 0, box_outside = 0;    // Unclamped object pixels.
+	long  clamped_px = 0;
 	float lo[3] = {1e9f, 1e9f, 1e9f}, hi[3] = {-1e9f, -1e9f, -1e9f};
 	for (int y = 0; y < gh; y++) {
 		for (int x = 0; x < gw; x++) {
 			const int idx = buffers.index(x, y);
 			faces[buffers.facing_map[idx] & shaded_face_mask]++;
+			clamped_px += (buffers.facing_map[idx] & shaded_face_clamped) ? 1 : 0;
+			const uint16_t id = buffers.object_ids[idx];
+			if (id != shaded_id_none && id != shaded_id_overflow && !(buffers.facing_map[idx] & shaded_face_clamped)) {
+				// Rebuilt position must lie in the object's box (within
+				// half a pixel; world x/y wrap is ignored here).
+				const Shaded_object_record& o = buffers.objects[id - 1];
+				float                       w[3];
+				world_position(x, y, w[0], w[1], w[2]);
+				constexpr float e = 0.07f;
+				box_px++;
+				if (w[0] < static_cast<float>(o.tx + 1 - o.xtiles) - e || w[0] > static_cast<float>(o.tx + 1) + e
+					|| w[1] < static_cast<float>(o.ty + 1 - o.ytiles) - e || w[1] > static_cast<float>(o.ty + 1) + e
+					|| w[2] < static_cast<float>(o.tz) - e || w[2] > static_cast<float>(o.tz + o.ztiles) + e) {
+					box_outside++;
+				}
+			}
 			if (main_actor_id == shaded_id_none || buffers.object_ids[idx] != main_actor_id) {
 				continue;
 			}
@@ -863,7 +881,9 @@ void Shaded_light::dump(Image_window8& win, int number, bool view, bool full) {
 		 << params.scroll_py << "\n"
 		 << "objects " << buffers.objects.size() << "\n"
 		 << "pixels none " << faces[shaded_face_none] << " ground " << faces[shaded_face_ground] << " top "
-		 << faces[shaded_face_top] << " south " << faces[shaded_face_south] << " east " << faces[shaded_face_east] << "\n";
+		 << faces[shaded_face_top] << " south " << faces[shaded_face_south] << " east " << faces[shaded_face_east] << "\n"
+		 << "object pixels (unclamped) " << box_px << " rebuilt outside their box " << box_outside << ", clamped "
+		 << clamped_px << "\n";
 	if (main_actor_id != shaded_id_none && main_actor_id != shaded_id_overflow) {
 		const Shaded_object_record& a = buffers.objects[main_actor_id - 1];
 		// The box spans tiles (tx + 1 - xtiles .. tx + 1) and lifts tz .. tz + ztiles.
