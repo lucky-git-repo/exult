@@ -407,6 +407,127 @@ struct Shaded_object_context {
 };
 
 /*
+ *  Game pixel coordinate (x, or y) of a world x (or y) at z lifts, and
+ *  back: one tile is ppt pixels, one lift moves ppl pixels up and left.
+ *  Unproject is Shaded_light::world_position; project is its inverse.
+ */
+constexpr float Shaded_project(float w, float z, int scroll_tile, int scroll_px, float ppt, float ppl) {
+	return (w - static_cast<float>(scroll_tile)) * ppt - static_cast<float>(scroll_px) - z * ppl - 0.5f;
+}
+
+constexpr float Shaded_unproject(int pixel, float z, int scroll_tile, int scroll_px, float ppt, float ppl) {
+	return static_cast<float>(scroll_tile) + (static_cast<float>(pixel + scroll_px) + 0.5f + z * ppl) / ppt;
+}
+
+/*
+ *  Signed distance from a point to a box, in two parts: the squared
+ *  distance outside it (0 inside) and, inside, minus the distance to the
+ *  nearest face (0 outside).  The distance is sqrt(outside2) or inside.
+ */
+struct Shaded_box_distance {
+	float outside2;
+	float inside;
+};
+
+constexpr Shaded_box_distance Shaded_box_sd(const float q[3], const float lo[3], const float hi[3]) {
+	float outside2 = 0.0f;
+	float inside   = -1e30f;
+	for (int i = 0; i < 3; i++) {
+		const float below = lo[i] - q[i];
+		const float above = q[i] - hi[i];
+		const float d     = below > above ? below : above;
+		if (d > 0.0f) {
+			outside2 += d * d;
+		}
+		inside = d > inside ? d : inside;
+	}
+	return Shaded_box_distance{outside2, outside2 > 0.0f ? 0.0f : inside};
+}
+
+/*
+ *  Share of a soft light seen past an edge sd tiles away (negative:
+ *  inside the occluder) by a cone cone tiles wide there.
+ */
+constexpr float Shaded_cone_visibility(float sd, float cone, bool hard) {
+	if (hard) {
+		return sd > 0.0f ? 1.0f : 0.0f;
+	}
+	const float c = cone > 1.0f / 16.0f ? cone : 1.0f / 16.0f;
+	const float v = 0.5f + sd / (2.0f * c);
+	return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+}
+
+// Grid field values: transmittance * shaded_field_scale, or solid.
+constexpr uint8_t shaded_field_scale = 254;
+constexpr uint8_t shaded_field_solid = 255;
+
+/*
+ *  Trilinear blend of 8 grid field values (index bit 0 = x + 1, bit 1 =
+ *  y + 1, bit 2 = z + 1) at (fx, fy, fz) in [0, 1], leaving solid cells
+ *  out and renormalising: light does not leak along the inside of walls.
+ *  All solid gives 1.
+ */
+constexpr float Shaded_solid_trilinear(const uint8_t v[8], float fx, float fy, float fz) {
+	float wsum = 0.0f;
+	float vsum = 0.0f;
+	for (int i = 0; i < 8; i++) {
+		if (v[i] == shaded_field_solid) {
+			continue;
+		}
+		const float w = ((i & 1) ? fx : 1.0f - fx) * ((i & 2) ? fy : 1.0f - fy) * ((i & 4) ? fz : 1.0f - fz);
+		wsum += w;
+		vsum += w * static_cast<float>(v[i]);
+	}
+	if (wsum <= 1e-6f) {
+		return 1.0f;
+	}
+	return vsum / (wsum * static_cast<float>(shaded_field_scale));
+}
+
+/*
+ *  The traced shadows of one paint, as plain data.  Screen maps hold the
+ *  screen-space transmittance Ts (times the grid's when traced by rays)
+ *  of one light at one receiver per resolution x resolution block: cell
+ *  (cx, cy) is game pixel (cx * res + res / 2, cy * res + res / 2), value
+ *  Ts * 255.  Grid fields hold the grid transmittance Tg at the centres
+ *  of the grid cells around one light (shaded_field_*), index
+ *  (z * h + y) * w + x from grid-local cell (x, y, z) of the box.
+ */
+struct Shaded_shadow_map {
+	int32_t  x = 0, y = 0, w = 0, h = 0;    // Cells.
+	int32_t  light  = 0;
+	int32_t  build  = 0;    // Traced this paint (else kept from the cache).
+	uint32_t offset = 0;    // Into map_data.
+	int32_t  pad    = 0;
+};
+
+struct Shaded_shadow_field {
+	int32_t  x = 0, y = 0, z = 0, w = 0, h = 0, d = 0;    // Grid-local cells.
+	int32_t  light  = 0;
+	int32_t  build  = 0;
+	uint32_t offset = 0;    // Into field_data.
+	int32_t  pad[3] = {0, 0, 0};
+};
+
+struct Shaded_shadow_set {
+	int32_t resolution = 2;
+	int32_t area_w = 0, area_h = 0;      // Game area.
+	int32_t grid_tx = 0, grid_ty = 0;    // World tile of grid cell (0, 0).
+	int32_t screen   = 1;    // Maps hold Ts.
+	int32_t ray_grid = 0;    // Maps also hold Tg, traced per cell.
+	float   strength = 1.0f;
+	// Per light: index into maps or fields, -1 for none (T = 1).
+	std::vector<int32_t>             light_map;
+	std::vector<int32_t>             light_field;
+	std::vector<Shaded_shadow_map>   maps;
+	std::vector<Shaded_shadow_field> fields;
+	std::vector<uint8_t>             map_data;
+	std::vector<uint8_t>             field_data;
+};
+
+struct Shaded_grid_volume;
+
+/*
  *  CPU backend: each step is a plain function over the buffers.  Rectangles
  *  must already be clipped to the buffers' bounds.
  */
@@ -427,17 +548,52 @@ namespace Shaded_cpu {
 			unsigned char* frame);
 	// False colour code (index into the lut) for one pixel of a view.
 	int view_code(const Shaded_scene_buffers& buf, const Shaded_light_params& params, int index);
+	// Game pixels a light's reach may cover, unclipped and inclusive (x0 to
+	// x1, y0 to y1); false if it reaches nothing.
+	bool light_screen_span(
+			const Shaded_light_params& params, const Shaded_light_record& light, float& x0, float& y0, float& x1,
+			float& y1);
+	// The same as a rectangle clipped to a w x h game area (maybe empty).
+	Shaded_rect light_screen_rect(const Shaded_light_params& params, const Shaded_light_record& light, int w, int h);
 	// Sort the lights into params.bins_x x params.bins_y screen bins, each
 	// light into every bin its reach may cover.
 	void build_bins(
 			const Shaded_light_params& params, const std::vector<Shaded_light_record>& lights,
 			std::vector<uint32_t>& offsets, std::vector<uint16_t>& list);
+	// Rows [y0, y1) of a grid field: the grid's transmittance from each
+	// cell centre to the light into data + field.offset.
+	void grid_field_rows(
+			const Shaded_grid_volume& vol, const Shaded_light_params& params, const Shaded_light_record& light,
+			const Shaded_shadow_field& field, int y0, int y1, uint8_t* data);
+	// Cell rows [y0, y1) of the screen maps being built, over the cells
+	// rectangle: per cell the lights are ranked by unshadowed light and the
+	// top params.shadow_lights traced in screen space (others keep 1).
+	// With ray_grid, every light's map also gets the grid's transmittance.
+	// Adds the number of screen traces to traces.
+	void screen_shadow_rows(
+			const Shaded_scene_buffers& buf, const Shaded_light_params& params, const Shaded_light_record* lights,
+			const uint32_t* bin_offsets, const uint16_t* bin_lights, const Shaded_grid_volume* ray_grid,
+			Shaded_shadow_set& set, const Shaded_rect& cells, int y0, int y1, long& traces);
+	// Rows [y0, y1) (of the map) of a depth-aware 3x3 blur of a screen map
+	// into out + map.offset.
+	void blur_shadow_rows(
+			const Shaded_scene_buffers& buf, const Shaded_shadow_set& set, const Shaded_shadow_map& map, int y0, int y1,
+			uint8_t* out);
+	// Ts at a game pixel of the given height (height units): bilinear over
+	// the 4 nearest cells, those of another height weighted down.
+	float shadow_screen_at(
+			const Shaded_scene_buffers& buf, const Shaded_shadow_set& set, const Shaded_shadow_map& map, int x, int y,
+			int height);
+	// Tg at a world point (unwrapped is fine) from a grid field.
+	float shadow_grid_at(const Shaded_shadow_set& set, const Shaded_shadow_field& field, const Shaded_point& p);
 	// Light level of every pixel of rows [y0, y1) of r into levels (indexed
-	// like the buffers).  Bins as from build_bins.
+	// like the buffers).  Bins as from build_bins.  With shadows, each
+	// light but the self-light is scaled by 1 - strength * (1 - Ts * Tg)
+	// and shadow_out (if not null) gets 255 * shadowed / unshadowed light.
 	void light_rows(
 			const Shaded_scene_buffers& buf, const Shaded_light_params& params, const Shaded_light_record* lights,
 			const uint32_t* bin_offsets, const uint16_t* bin_lights, const Shaded_rect& r, int y0, int y1,
-			uint8_t* levels);
+			uint8_t* levels, const Shaded_shadow_set* shadows = nullptr, uint8_t* shadow_out = nullptr);
 	// Relight rows [y0, y1) of r of an 8-bit frame (indexed like the
 	// buffers): frame[i] = remap[levels[i] * 256 + frame[i]].
 	void apply_light_rows(

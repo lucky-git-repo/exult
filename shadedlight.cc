@@ -109,6 +109,49 @@ static_assert(Shaded_luminance(63, 63, 63) == 63000 && Shaded_luminance(0, 0, 0)
 static_assert(Shaded_luminance(0, 63, 0) > Shaded_luminance(63, 0, 0) && Shaded_luminance(63, 0, 0) > Shaded_luminance(0, 0, 63));
 // The cycling colours are left alone.
 static_assert(shaded_last_lit_index == 0xdf && shaded_remap_size == 32 * 256);
+// Projecting a recorded pixel's world position gives the pixel back.
+static_assert(Shaded_project(Shaded_unproject(37, 2.5f, 100, 3, 8.0f, 4.0f), 2.5f, 100, 3, 8.0f, 4.0f) == 37.0f);
+static_assert(Shaded_project(Shaded_unproject(-6, 0.0f, 2000, 0, 8.0f, 4.0f), 0.0f, 2000, 0, 8.0f, 4.0f) == -6.0f);
+// Shortest way round the world.
+static_assert(Shaded_wrap_delta(3070.0f) == -2.0f && Shaded_wrap_delta(-3070.0f) == 2.0f && Shaded_wrap_delta(5.0f) == 5.0f);
+// A point light's target is the light, a directional one 64 units on.
+static_assert(Shaded_shadow_target(Shaded_light_record{1.0f, 2.0f, 3.0f, 4, 1, 1, 1, 1, 0, 0, 0, 0}, Shaded_point{3071.0f, 2.0f, 0.0f}).x
+			  == 3073.0f);
+static_assert(Shaded_shadow_target(Shaded_light_record{0.5f, 0.0f, 0.25f, 4, 1, 1, 1, 1, shaded_light_directional, 0, 0, 0},
+								   Shaded_point{10.0f, 10.0f, 0.0f})
+					  .z
+			  == 16.0f);
+namespace {
+	constexpr float box_lo[3] = {0.0f, 0.0f, 0.0f};
+	constexpr float box_hi[3] = {2.0f, 2.0f, 2.0f};
+	constexpr float q_out[3]  = {4.0f, 1.0f, 1.0f};
+	constexpr float q_in[3]   = {1.0f, 1.0f, 1.5f};
+	constexpr float q_edge[3] = {3.0f, 3.0f, 1.0f};
+}    // namespace
+
+// Signed box distance: 2 tiles outside, half a tile inside, a corner.
+static_assert(Shaded_box_sd(q_out, box_lo, box_hi).outside2 == 4.0f && Shaded_box_sd(q_out, box_lo, box_hi).inside == 0.0f);
+static_assert(Shaded_box_sd(q_in, box_lo, box_hi).outside2 == 0.0f && Shaded_box_sd(q_in, box_lo, box_hi).inside == -0.5f);
+static_assert(Shaded_box_sd(q_edge, box_lo, box_hi).outside2 == 2.0f);
+// Cone visibility: half at the edge, full a cone radius out, none as far in.
+static_assert(Shaded_cone_visibility(0.0f, 0.5f, false) == 0.5f);
+static_assert(Shaded_cone_visibility(0.5f, 0.5f, false) == 1.0f && Shaded_cone_visibility(-0.5f, 0.5f, false) == 0.0f);
+static_assert(Shaded_cone_visibility(0.03125f, 0.0f, false) == 0.75f);    // Cone at least 1/16.
+static_assert(Shaded_cone_visibility(0.01f, 0.5f, true) == 1.0f && Shaded_cone_visibility(-0.01f, 0.5f, true) == 0.0f);
+namespace {
+	constexpr uint8_t field_clear[8] = {254, 254, 254, 254, 254, 254, 254, 254};
+	constexpr uint8_t field_solid[8] = {255, 255, 255, 255, 255, 255, 255, 255};
+	constexpr uint8_t field_wall[8]  = {255, 0, 255, 0, 255, 0, 255, 0};      // Solid at x, dark at x + 1.
+	constexpr uint8_t field_half[8]  = {254, 0, 254, 0, 254, 0, 254, 0};
+	constexpr uint8_t field_lit[8]   = {255, 254, 255, 254, 255, 254, 255, 254};
+}    // namespace
+
+// Solid-aware trilinear: solid cells are left out, all solid is open.
+static_assert(Shaded_solid_trilinear(field_clear, 0.25f, 0.5f, 0.75f) == 1.0f);
+static_assert(Shaded_solid_trilinear(field_solid, 0.5f, 0.5f, 0.5f) == 1.0f);
+static_assert(Shaded_solid_trilinear(field_wall, 0.5f, 0.5f, 0.5f) == 0.0f);
+static_assert(Shaded_solid_trilinear(field_half, 0.5f, 0.5f, 0.5f) == 0.5f);
+static_assert(Shaded_solid_trilinear(field_lit, 0.25f, 0.5f, 0.5f) == 1.0f);
 
 /*
  *  A small persistent thread pool for the light pass.  run() hands bands
@@ -547,6 +590,59 @@ int Shaded_cpu::view_code(const Shaded_scene_buffers& buf, const Shaded_light_pa
 	return 0;
 }
 
+bool Shaded_cpu::light_screen_span(
+		const Shaded_light_params& params, const Shaded_light_record& light, float& x0, float& y0, float& x1, float& y1) {
+	const float r = light.radius * params.radius_scale;
+	if (r <= 0.0f || (light.flags & (shaded_light_off | shaded_light_directional))) {
+		return false;
+	}
+	const auto tiles = static_cast<float>(c_num_tiles);
+	auto       wrap  = [tiles](float d) {
+		d = std::fmod(d, tiles);
+		if (d > tiles * 0.5f) {
+			d -= tiles;
+		} else if (d < -tiles * 0.5f) {
+			d += tiles;
+		}
+		return d;
+	};
+	// Heights the light can reach: within R in 3D, or the area band.
+	float zlo, zhi;
+	if (light.flags & shaded_light_area) {
+		zlo = light.z - 1.0f;
+		zhi = light.z + params.area_height;
+	} else {
+		zlo = light.z - r / params.tiles_per_lift;
+		zhi = light.z + r / params.tiles_per_lift;
+	}
+	zlo = std::max(zlo, 0.0f);
+	zhi = std::max(zhi, zlo);
+	// Pixel range covered by world x (or y) in [lo, hi] tiles from the
+	// scroll tile, at heights zlo..zhi lifts: px = 8 * w - scroll_px - 0.5 - 4 * z.
+	auto cover = [&](float lo, float hi, int scroll_px, float& p0, float& p1) {
+		p0 = lo * params.pixels_per_tile - static_cast<float>(scroll_px) - 0.5f - zhi * params.pixels_per_lift;
+		p1 = hi * params.pixels_per_tile - static_cast<float>(scroll_px) - 0.5f - zlo * params.pixels_per_lift;
+	};
+	const float dx = wrap(light.x - static_cast<float>(params.scroll_tx));
+	const float dy = wrap(light.y - static_cast<float>(params.scroll_ty));
+	cover(dx - r, dx + r, params.scroll_px, x0, x1);
+	cover(dy - r, dy + r, params.scroll_py, y0, y1);
+	return true;
+}
+
+Shaded_rect Shaded_cpu::light_screen_rect(const Shaded_light_params& params, const Shaded_light_record& light, int w, int h) {
+	float x0, y0, x1, y1;
+	if (!light_screen_span(params, light, x0, y0, x1, y1)) {
+		return Shaded_rect{};
+	}
+	// Whole pixels, clamped first so far lights cannot overflow an int.
+	const auto lo_x = static_cast<int>(std::floor(std::clamp(x0, -1.0f, static_cast<float>(w))));
+	const auto lo_y = static_cast<int>(std::floor(std::clamp(y0, -1.0f, static_cast<float>(h))));
+	const auto hi_x = static_cast<int>(std::floor(std::clamp(x1, -1.0f, static_cast<float>(w))));
+	const auto hi_y = static_cast<int>(std::floor(std::clamp(y1, -1.0f, static_cast<float>(h))));
+	return Intersect(Shaded_rect{lo_x, lo_y, hi_x - lo_x + 1, hi_y - lo_y + 1}, Shaded_rect{0, 0, w, h});
+}
+
 void Shaded_cpu::build_bins(
 		const Shaded_light_params& params, const std::vector<Shaded_light_record>& lights, std::vector<uint32_t>& offsets,
 		std::vector<uint16_t>& list) {
@@ -562,47 +658,19 @@ void Shaded_cpu::build_bins(
 	};
 
 	std::vector<Span> spans(lights.size(), Span{0, 0, -1, -1});
-	const auto        tiles = static_cast<float>(c_num_tiles);
 	const auto        size  = static_cast<float>(params.bin_size);
-	auto              wrap  = [tiles](float d) {
-		d = std::fmod(d, tiles);
-		if (d > tiles * 0.5f) {
-			d -= tiles;
-		} else if (d < -tiles * 0.5f) {
-			d += tiles;
-		}
-		return d;
-	};
-	// Pixel range covered by world x (or y) in [lo, hi] tiles from the
-	// scroll tile, at heights zlo..zhi lifts: px = 8 * w - scroll_px - 0.5 - 4 * z.
-	auto cover = [&](float lo, float hi, int scroll_px, float zlo, float zhi, int count, int& c0, int& c1) {
-		const float p0 = lo * params.pixels_per_tile - static_cast<float>(scroll_px) - 0.5f - zhi * params.pixels_per_lift;
-		const float p1 = hi * params.pixels_per_tile - static_cast<float>(scroll_px) - 0.5f - zlo * params.pixels_per_lift;
-		c0             = std::max(static_cast<int>(std::floor(p0 / size)), 0);
-		c1             = std::min(static_cast<int>(std::floor(p1 / size)), count - 1);
+	auto              cover = [size](float p0, float p1, int count, int& c0, int& c1) {
+		c0 = std::max(static_cast<int>(std::floor(p0 / size)), 0);
+		c1 = std::min(static_cast<int>(std::floor(p1 / size)), count - 1);
 	};
 	for (size_t i = 0; i < lights.size(); i++) {
-		const Shaded_light_record& l = lights[i];
-		const float                r = l.radius * params.radius_scale;
-		if (r <= 0.0f || (l.flags & shaded_light_off)) {
+		float px0, py0, px1, py1;
+		if (!light_screen_span(params, lights[i], px0, py0, px1, py1)) {
 			continue;
 		}
-		// Heights the light can reach: within R in 3D, or the area band.
-		float zlo, zhi;
-		if (l.flags & shaded_light_area) {
-			zlo = l.z - 1.0f;
-			zhi = l.z + params.area_height;
-		} else {
-			zlo = l.z - r / params.tiles_per_lift;
-			zhi = l.z + r / params.tiles_per_lift;
-		}
-		zlo               = std::max(zlo, 0.0f);
-		zhi               = std::max(zhi, zlo);
-		const float dx    = wrap(l.x - static_cast<float>(params.scroll_tx));
-		const float dy    = wrap(l.y - static_cast<float>(params.scroll_ty));
-		Span&       span  = spans[i];
-		cover(dx - r, dx + r, params.scroll_px, zlo, zhi, params.bins_x, span.x0, span.x1);
-		cover(dy - r, dy + r, params.scroll_py, zlo, zhi, params.bins_y, span.y0, span.y1);
+		Span& span = spans[i];
+		cover(px0, px1, params.bins_x, span.x0, span.x1);
+		cover(py0, py1, params.bins_y, span.y0, span.y1);
 		for (int y = span.y0; y <= span.y1; y++) {
 			for (int x = span.x0; x <= span.x1; x++) {
 				offsets[static_cast<size_t>(y * params.bins_x + x) + 1]++;
@@ -624,9 +692,337 @@ void Shaded_cpu::build_bins(
 	}
 }
 
+namespace {
+	int Floor_div(int a, int b) {
+		const int q = a / b;
+		return (a % b != 0 && (a < 0) != (b < 0)) ? q - 1 : q;
+	}
+
+	// Buffer index of the receiver pixel of screen map cell (cx, cy).
+	inline int Cell_pixel(const Shaded_scene_buffers& buf, const Shaded_shadow_set& set, int cx, int cy) {
+		const int half = set.resolution / 2;
+		const int x    = std::clamp(cx * set.resolution + half, 0, std::max(set.area_w - 1, 0));
+		const int y    = std::clamp(cy * set.resolution + half, 0, std::max(set.area_h - 1, 0));
+		return buf.index(x, y);
+	}
+
+	// World position of a recorded pixel as Shaded_cpu::light_rows has it
+	// (unwrapped, from the scroll tile).
+	inline Shaded_point Pixel_world(const Shaded_scene_buffers& buf, const Shaded_light_params& params, int x, int y) {
+		const float wz = static_cast<float>(buf.height_map[buf.index(x, y)]) / params.height_units_per_lift;
+		return Shaded_point{Shaded_unproject(x, wz, params.scroll_tx, params.scroll_px, params.pixels_per_tile, params.pixels_per_lift),
+							Shaded_unproject(y, wz, params.scroll_ty, params.scroll_py, params.pixels_per_tile, params.pixels_per_lift),
+							wz};
+	}
+
+	// Unshadowed light of l at p on a face with normal n (no self-light),
+	// as Shaded_cpu::light_rows adds it.
+	float Unshadowed(const Shaded_light_params& params, const Shaded_light_record& l, const Shaded_point& p, const Shaded_normal& n) {
+		const float radius = l.radius * params.radius_scale;
+		const float r2     = radius * radius;
+		const float dx     = Shaded_wrap_delta(l.x - p.x);
+		const float dy     = Shaded_wrap_delta(l.y - p.y);
+		const float h2     = dx * dx + dy * dy;
+		if ((l.flags & (shaded_light_off | shaded_light_directional)) || h2 >= r2) {
+			return 0.0f;
+		}
+		if (l.flags & shaded_light_area) {
+			return p.z >= l.z - 1.0f && p.z <= l.z + params.area_height ? l.intensity * Shaded_falloff(h2 / r2) : 0.0f;
+		}
+		const float dz = (l.z - p.z) * params.tiles_per_lift;
+		const float d2 = h2 + dz * dz;
+		if (d2 >= r2) {
+			return 0.0f;
+		}
+		const float dot   = static_cast<float>(n.x) * dx + static_cast<float>(n.y) * dy + static_cast<float>(n.z) * dz;
+		const float ndotl = d2 > 1e-6f ? dot / std::sqrt(d2) : 1.0f;
+		if (ndotl <= 0.0f) {
+			return 0.0f;
+		}
+		return l.intensity * Shaded_falloff(d2 / r2) * (params.facing_min + (1.0f - params.facing_min) * ndotl);
+	}
+
+	/*
+	 *  Screen-space transmittance from receiver p (record id own) to target:
+	 *  samples along the way are projected into the frame, and the box of
+	 *  the object drawn there (not the receiver's or the light's own) is
+	 *  tested with a cone as wide as the light seen from p.
+	 */
+	float Screen_transmittance(
+			const Shaded_scene_buffers& buf, const Shaded_light_params& params, const Shaded_shadow_set& set,
+			const Shaded_point& p, const Shaded_point& target, int own, int light_id) {
+		const float dx = target.x - p.x;
+		const float dy = target.y - p.y;
+		const float dz = target.z - p.z;    // Lifts.
+		const float dt = dz * params.tiles_per_lift;
+		const float dist = std::sqrt(dx * dx + dy * dy + dt * dt);
+		const float bias = params.shadow_bias;
+		if (dist <= bias) {
+			return 1.0f;
+		}
+		// Samples: one per 2 screen pixels, within [4, shadow_steps].
+		const float sx    = dx * params.pixels_per_tile - dz * params.pixels_per_lift;
+		const float sy    = dy * params.pixels_per_tile - dz * params.pixels_per_lift;
+		const int   steps = std::clamp(static_cast<int>(std::sqrt(sx * sx + sy * sy) * 0.5f), 4, std::max(params.shadow_steps, 4));
+		const float size  = 0.5f * params.shadow_softness;    // Light size, tiles.
+		const bool  hard  = params.shadow_softness <= 0.0f;
+		const int   count = static_cast<int>(buf.objects.size());
+		float       ts    = 1.0f;
+		for (int k = 0; k < steps; k++) {
+			const float s  = bias + (dist - bias) * (static_cast<float>(k) + 0.5f) / static_cast<float>(steps);
+			const float t  = s / dist;
+			const float qx = p.x + dx * t;
+			const float qy = p.y + dy * t;
+			const float qz = p.z + dz * t;
+			const float fx = Shaded_project(qx, qz, params.scroll_tx, params.scroll_px, params.pixels_per_tile, params.pixels_per_lift);
+			const float fy = Shaded_project(qy, qz, params.scroll_ty, params.scroll_py, params.pixels_per_tile, params.pixels_per_lift);
+			const int   px = static_cast<int>(std::floor(fx + 0.5f));
+			const int   py = static_cast<int>(std::floor(fy + 0.5f));
+			if (px < 0 || py < 0 || px >= set.area_w || py >= set.area_h) {
+				break;    // Off screen: the grid covers the rest.
+			}
+			const int id = buf.object_ids[buf.index(px, py)];
+			if (id == shaded_id_none || id == shaded_id_overflow || id == own || id == light_id || id > count) {
+				continue;
+			}
+			const uint8_t opacity = buf.object_opacity[id - 1];
+			if (opacity == 0) {
+				continue;
+			}
+			// The object's box, relative to its SE bottom corner, in tiles.
+			const Shaded_object_record& o     = buf.objects[id - 1];
+			const float                 q[3]  = {Shaded_wrap_delta(qx - static_cast<float>(o.tx + 1)),
+												 Shaded_wrap_delta(qy - static_cast<float>(o.ty + 1)),
+												 (qz - static_cast<float>(o.tz)) * params.tiles_per_lift};
+			const float                 lo[3] = {-static_cast<float>(o.xtiles), -static_cast<float>(o.ytiles), 0.0f};
+			const float                 hi[3] = {0.0f, 0.0f, static_cast<float>(o.ztiles) * params.tiles_per_lift};
+			const Shaded_box_distance   bd    = Shaded_box_sd(q, lo, hi);
+			const float                 sd    = bd.outside2 > 0.0f ? std::sqrt(bd.outside2) : bd.inside;
+			const float                 v     = Shaded_cone_visibility(sd, size * s / dist, hard);
+			ts = std::min(ts, 1.0f - static_cast<float>(opacity) / 255.0f * (1.0f - v));
+			if (ts <= 0.0f) {
+				break;
+			}
+		}
+		return ts;
+	}
+}    // namespace
+
+void Shaded_cpu::grid_field_rows(
+		const Shaded_grid_volume& vol, const Shaded_light_params& params, const Shaded_light_record& light,
+		const Shaded_shadow_field& field, int y0, int y1, uint8_t* data) {
+	ignore_unused_variable_warning(params);
+	for (int y = y0; y < y1; y++) {
+		const int ly = field.y + y;
+		for (int z = 0; z < field.d; z++) {
+			const int lz  = field.z + z;
+			uint8_t*  out = data + field.offset + (static_cast<size_t>(z) * field.h + y) * field.w;
+			for (int x = 0; x < field.w; x++) {
+				const int lx = field.x + x;
+				if (vol.opacity(lx, ly, lz) == 255) {
+					out[x] = shaded_field_solid;
+					continue;
+				}
+				const Shaded_point    c{static_cast<float>(vol.origin_tx + lx) + 0.5f, static_cast<float>(vol.origin_ty + ly) + 0.5f,
+                                        static_cast<float>(lz) + 0.5f};
+				const Shaded_point    t = Shaded_shadow_target(light, c);
+				const Shaded_grid_ray ray{
+						{c.x, c.y, c.z, 0.0f},
+						{t.x, t.y, t.z, 0.0f}
+				};
+				const float tr = Shaded_grid_cpu::trace(vol, ray, 0).transmittance;
+				out[x]         = static_cast<uint8_t>(std::lround(std::clamp(tr, 0.0f, 1.0f) * shaded_field_scale));
+			}
+		}
+	}
+}
+
+void Shaded_cpu::screen_shadow_rows(
+		const Shaded_scene_buffers& buf, const Shaded_light_params& params, const Shaded_light_record* lights,
+		const uint32_t* bin_offsets, const uint16_t* bin_lights, const Shaded_grid_volume* ray_grid, Shaded_shadow_set& set,
+		const Shaded_rect& cells, int y0, int y1, long& traces) {
+	if (params.bins_x <= 0 || params.bins_y <= 0) {
+		return;
+	}
+	struct Candidate {
+		float   light;    // Unshadowed.
+		float   value;    // Transmittance so far.
+		int     map;
+		bool    taken;
+	};
+
+	Candidate  cand[shaded_max_lights];
+	const int  top_k = std::clamp(params.shadow_lights, 1, 16);
+	for (int cy = y0; cy < y1; cy++) {
+		for (int cx = cells.x; cx < cells.x + cells.w; cx++) {
+			const int     idx  = Cell_pixel(buf, set, cx, cy);
+			const uint8_t face = buf.facing_map[idx] & shaded_face_mask;
+			if (face == shaded_face_none) {
+				continue;    // Maps hold 1.
+			}
+			const int          row = (idx - buf.origin) / buf.stride;
+			const int          col = idx - buf.origin - row * buf.stride;
+			const Shaded_point p   = Pixel_world(buf, params, col, row);
+			const int          own = buf.object_ids[idx];
+			const Shaded_normal n  = Shaded_face_normal(face);
+			const int          bin = std::clamp(row / params.bin_size, 0, params.bins_y - 1) * params.bins_x
+							+ std::clamp(col / params.bin_size, 0, params.bins_x - 1);
+			int   count = 0;
+			float best  = 0.0f;
+			for (uint32_t k = bin_offsets[bin]; k < bin_offsets[bin + 1]; k++) {
+				const int li = bin_lights[k];
+				const int m  = set.light_map[li];
+				if (m < 0) {
+					continue;
+				}
+				const Shaded_shadow_map&   map = set.maps[m];
+				const Shaded_light_record& l   = lights[li];
+				if (cx < map.x || cy < map.y || cx >= map.x + map.w || cy >= map.y + map.h
+					|| (own != shaded_id_none && l.object_id == own)) {
+					continue;    // Self-light is never shadowed.
+				}
+				const float c = Unshadowed(params, l, p, n);
+				if (c <= 0.0f) {
+					continue;
+				}
+				float value = 1.0f;
+				if (ray_grid && map.build) {    // Tg for every light.
+					const Shaded_point    t = Shaded_shadow_target(l, p);
+					const Shaded_grid_ray ray{
+							{p.x, p.y, p.z, 0.0f},
+							{t.x, t.y, t.z, 0.0f}
+					};
+					value = Shaded_grid_cpu::trace(*ray_grid, ray, 0).transmittance;
+				}
+				cand[count++] = Candidate{c, value, m, false};
+				best          = std::max(best, c);
+			}
+			// The strongest lights get the screen-space trace.
+			for (int round = 0; set.screen && round < top_k; round++) {
+				int pick = -1;
+				for (int i = 0; i < count; i++) {
+					if (!cand[i].taken && (pick < 0 || cand[i].light > cand[pick].light)) {
+						pick = i;
+					}
+				}
+				if (pick < 0 || cand[pick].light < best / 64.0f) {
+					break;
+				}
+				cand[pick].taken = true;
+				const Shaded_shadow_map& map = set.maps[cand[pick].map];
+				if (!map.build) {
+					continue;
+				}
+				const Shaded_light_record& l = lights[map.light];
+				cand[pick].value *= Screen_transmittance(buf, params, set, p, Shaded_shadow_target(l, p), own, l.object_id);
+				traces++;
+			}
+			for (int i = 0; i < count; i++) {
+				const Shaded_shadow_map& map = set.maps[cand[i].map];
+				if (map.build) {
+					set.map_data[map.offset + static_cast<size_t>(cy - map.y) * map.w + (cx - map.x)]
+							= static_cast<uint8_t>(std::lround(std::clamp(cand[i].value, 0.0f, 1.0f) * 255.0f));
+				}
+			}
+		}
+	}
+}
+
+void Shaded_cpu::blur_shadow_rows(
+		const Shaded_scene_buffers& buf, const Shaded_shadow_set& set, const Shaded_shadow_map& map, int y0, int y1,
+		uint8_t* out) {
+	const uint8_t* in = set.map_data.data() + map.offset;
+	out += map.offset;
+	for (int j = y0; j < y1; j++) {
+		for (int i = 0; i < map.w; i++) {
+			const size_t at  = static_cast<size_t>(j) * map.w + i;
+			const int    idx = Cell_pixel(buf, set, map.x + i, map.y + j);
+			if ((buf.facing_map[idx] & shaded_face_mask) == shaded_face_none) {
+				out[at] = in[at];
+				continue;
+			}
+			// 1-2-1 weights, neighbours more than a lift away left out.
+			const int h0   = buf.height_map[idx];
+			int       wsum = 0;
+			int       vsum = 0;
+			for (int dj = -1; dj <= 1; dj++) {
+				for (int di = -1; di <= 1; di++) {
+					const int ni = i + di;
+					const int nj = j + dj;
+					if (ni < 0 || nj < 0 || ni >= map.w || nj >= map.h) {
+						continue;
+					}
+					const int nidx = Cell_pixel(buf, set, map.x + ni, map.y + nj);
+					if ((buf.facing_map[nidx] & shaded_face_mask) == shaded_face_none
+						|| std::abs(buf.height_map[nidx] - h0) > shaded_height_units_per_lift) {
+						continue;
+					}
+					const int w = (di ? 1 : 2) * (dj ? 1 : 2);
+					wsum += w;
+					vsum += w * in[static_cast<size_t>(nj) * map.w + ni];
+				}
+			}
+			out[at] = static_cast<uint8_t>(wsum > 0 ? (vsum + wsum / 2) / wsum : in[at]);
+		}
+	}
+}
+
+float Shaded_cpu::shadow_screen_at(
+		const Shaded_scene_buffers& buf, const Shaded_shadow_set& set, const Shaded_shadow_map& map, int x, int y, int height) {
+	const int      res  = set.resolution;
+	const int      nx   = x - res / 2;
+	const int      ny   = y - res / 2;
+	const int      i0   = Floor_div(nx, res);
+	const int      j0   = Floor_div(ny, res);
+	const float    fx   = static_cast<float>(nx - i0 * res) / static_cast<float>(res);
+	const float    fy   = static_cast<float>(ny - j0 * res) / static_cast<float>(res);
+	const uint8_t* data = set.map_data.data() + map.offset;
+	float          wsum = 0.0f;
+	float          vsum = 0.0f;
+	for (int dj = 0; dj < 2; dj++) {
+		for (int di = 0; di < 2; di++) {
+			float w = (di ? fx : 1.0f - fx) * (dj ? fy : 1.0f - fy);
+			if (w <= 0.0f) {
+				continue;
+			}
+			const int ci = std::clamp(i0 + di, map.x, map.x + map.w - 1);
+			const int cj = std::clamp(j0 + dj, map.y, map.y + map.h - 1);
+			// Joint bilateral: cells on another surface count little.
+			if (std::abs(buf.height_map[Cell_pixel(buf, set, ci, cj)] - height) > shaded_height_units_per_lift) {
+				w *= 0.05f;
+			}
+			wsum += w;
+			vsum += w * static_cast<float>(data[static_cast<size_t>(cj - map.y) * map.w + (ci - map.x)]);
+		}
+	}
+	return wsum > 0.0f ? vsum / (wsum * 255.0f) : 1.0f;
+}
+
+float Shaded_cpu::shadow_grid_at(const Shaded_shadow_set& set, const Shaded_shadow_field& field, const Shaded_point& p) {
+	const float u  = std::clamp(Shaded_wrap_delta(p.x - static_cast<float>(set.grid_tx)) - static_cast<float>(field.x) - 0.5f, 0.0f,
+								static_cast<float>(field.w - 1));
+	const float v  = std::clamp(Shaded_wrap_delta(p.y - static_cast<float>(set.grid_ty)) - static_cast<float>(field.y) - 0.5f, 0.0f,
+								static_cast<float>(field.h - 1));
+	const float w  = std::clamp(p.z - static_cast<float>(field.z) - 0.5f, 0.0f, static_cast<float>(field.d - 1));
+	const int   i0 = static_cast<int>(u);
+	const int   j0 = static_cast<int>(v);
+	const int   k0 = static_cast<int>(w);
+	const int   i1 = std::min(i0 + 1, field.w - 1);
+	const int   j1 = std::min(j0 + 1, field.h - 1);
+	const int   k1 = std::min(k0 + 1, field.d - 1);
+	const uint8_t* data = set.field_data.data() + field.offset;
+	auto           at   = [&](int i, int j, int k) {
+		return data[(static_cast<size_t>(k) * field.h + j) * field.w + i];
+	};
+	const uint8_t corners[8] = {at(i0, j0, k0), at(i1, j0, k0), at(i0, j1, k0), at(i1, j1, k0),
+								at(i0, j0, k1), at(i1, j0, k1), at(i0, j1, k1), at(i1, j1, k1)};
+	return Shaded_solid_trilinear(corners, u - static_cast<float>(i0), v - static_cast<float>(j0), w - static_cast<float>(k0));
+}
+
 void Shaded_cpu::light_rows(
 		const Shaded_scene_buffers& buf, const Shaded_light_params& params, const Shaded_light_record* lights,
-		const uint32_t* bin_offsets, const uint16_t* bin_lights, const Shaded_rect& r, int y0, int y1, uint8_t* levels) {
+		const uint32_t* bin_offsets, const uint16_t* bin_lights, const Shaded_rect& r, int y0, int y1, uint8_t* levels,
+		const Shaded_shadow_set* shadows, uint8_t* shadow_out) {
 	if (params.bins_x <= 0 || params.bins_y <= 0) {
 		return;
 	}
@@ -663,6 +1059,9 @@ void Shaded_cpu::light_rows(
 			const uint8_t face = buf.facing_map[idx] & shaded_face_mask;
 			if (face == shaded_face_none) {
 				levels[idx] = quantise(ambient, x, y);
+				if (shadow_out) {
+					shadow_out[idx] = 255;
+				}
 				continue;
 			}
 			// World position as in Shaded_light::world_position, unwrapped.
@@ -673,10 +1072,26 @@ void Shaded_cpu::light_rows(
 			const int           id   = buf.object_ids[idx];
 			const int           bin  = bin_y * params.bins_x + std::clamp(x / params.bin_size, 0, params.bins_x - 1);
 			float               sum  = 0.0f;
+			float               full = 0.0f;    // Unshadowed sum, with shadows.
+			// Light let through: 1 - strength * (1 - Ts * Tg).  With strength
+			// 0 it is exactly 1, and the sums below are those without shadows.
+			auto shadow_factor = [&](int li) {
+				float     t = 1.0f;
+				const int m = shadows->light_map[li];
+				if (m >= 0) {
+					t = shadow_screen_at(buf, *shadows, shadows->maps[m], x, y, buf.height_map[idx]);
+				}
+				const int f = shadows->light_field[li];
+				if (f >= 0) {
+					t *= shadow_grid_at(*shadows, shadows->fields[f], Shaded_point{px, py, wz});
+				}
+				return 1.0f - shadows->strength * (1.0f - t);
+			};
 			for (uint32_t k = bin_offsets[bin]; k < bin_offsets[bin + 1]; k++) {
 				const Shaded_light_record& l = lights[bin_lights[k]];
 				if (id != shaded_id_none && l.object_id == id) {
 					sum += l.intensity;    // The light's own object.
+					full += l.intensity;
 					continue;
 				}
 				const float radius = l.radius * params.radius_scale;
@@ -689,7 +1104,13 @@ void Shaded_cpu::light_rows(
 				}
 				if (l.flags & shaded_light_area) {
 					if (wz >= l.z - 1.0f && wz <= l.z + params.area_height) {
-						sum += l.intensity * Shaded_falloff(h2 / r2);
+						if (!shadows) {
+							sum += l.intensity * Shaded_falloff(h2 / r2);
+							continue;
+						}
+						const float f = shadow_factor(bin_lights[k]);
+						full += l.intensity * Shaded_falloff(h2 / r2);
+						sum += l.intensity * f * Shaded_falloff(h2 / r2);
 					}
 					continue;
 				}
@@ -703,10 +1124,19 @@ void Shaded_cpu::light_rows(
 				if (ndotl <= 0.0f) {
 					continue;
 				}
-				sum += l.intensity * Shaded_falloff(d2 / r2) * (facing + (1.0f - facing) * ndotl);
+				if (!shadows) {
+					sum += l.intensity * Shaded_falloff(d2 / r2) * (facing + (1.0f - facing) * ndotl);
+					continue;
+				}
+				const float f = shadow_factor(bin_lights[k]);
+				full += l.intensity * Shaded_falloff(d2 / r2) * (facing + (1.0f - facing) * ndotl);
+				sum += l.intensity * f * Shaded_falloff(d2 / r2) * (facing + (1.0f - facing) * ndotl);
 			}
 			const float level = ambient + (1.0f - ambient) * (1.0f - std::exp(-sum * params.brightness * inv_soft));
 			levels[idx]       = quantise(level, x, y);
+			if (shadow_out) {
+				shadow_out[idx] = full > 0.0f ? static_cast<uint8_t>(std::lround(std::clamp(sum / full, 0.0f, 1.0f) * 255.0f)) : 255;
+			}
 		}
 	}
 }
