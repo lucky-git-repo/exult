@@ -37,8 +37,10 @@
 
 #include "shapeid.h"
 
+#include <array>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <iosfwd>
@@ -52,6 +54,10 @@
 class Game_object;
 class Image_buffer8;
 class Image_window8;
+class Shape_frame;
+struct Shaded_weather_input;
+struct Shaded_weather_set;
+struct Shaded_weather_out;
 
 // Facing values: the low 3 bits of each facing pixel.
 constexpr uint8_t shaded_face_none    = 0;
@@ -83,6 +89,7 @@ enum class Shaded_view : int32_t {
 	unlit,     // The frame without the light pass.
 	shadow,    // Shadowed share of the light as a grey ramp.
 	normals,    // Surface normal as false colour (x, y, z to red, green, blue).
+	weather,    // Sky factor (grey, black under cover), fog (cyan), flash (white).
 	count
 };
 
@@ -164,9 +171,33 @@ struct alignas(16) Shaded_light_params {
 	int32_t roof_seams       = 1;
 	float   rounded_profile  = 1.0f;    // Reserved: bulge profile scale.
 	float   rounded_reserved = 0.0f;
+	// Weather (config/video/shaded_light/weather/...).  weather = 0 lights
+	// exactly as before it was added; weather_active is set per paint when
+	// the light pass has weather terms to apply.
+	int32_t weather           = 1;
+	int32_t lightning_shadows = 1;
+	int32_t precipitation     = 1;
+	int32_t weather_active    = 0;
+	float   cloud_shadows     = 0.4f;    // Share of the sky light a full cloud takes.
+	float   cloud_softness    = 6.0f;    // Blur radius of the cloud patches, pixels.
+	float   overcast_soften   = 0.5f;    // Overcast weakens and softens shadows by this.
+	float   overcast          = 0.0f;    // 1 while the clock shows the overcast palette.
+	float   fog_density       = 1.0f;
+	float   fog_height        = 4.0f;    // Lifts.
+	float   fog_distance      = 6.0f;    // Tiles.
+	float   fog_clear         = 2.0f;    // Tiles round the Avatar left clear.
+	float   fog_fade          = 3.0f;    // Tiles over which sky terms fade in at doorways.
+	float   fog_scatter       = 1.0f;
+	float   fog_mix           = 0.0f;
+	int32_t fog               = 0;
+	float   avatar_x = 0.0f, avatar_y = 0.0f, avatar_z = 0.0f;
+	int32_t cloud_count = 0;
+	float   flash   = 0.0f;
+	float   flash_x = 0.0f, flash_y = 0.0f, flash_z = 0.0f;
 };
 
 static_assert(sizeof(Shaded_light_params) % 16 == 0);
+static_assert(offsetof(Shaded_light_params, weather) % 16 == 0);
 static_assert(std::is_trivially_copyable_v<Shaded_light_params> && std::is_standard_layout_v<Shaded_light_params>);
 
 /*
@@ -312,6 +343,13 @@ struct Shaded_scene_buffers {
 	std::vector<uint16_t>             object_ids;    // shaded_id_*.
 	std::vector<uint8_t>              light_levels;    // 0..level_count - 1.
 	std::vector<uint8_t>              shadow_levels;    // 255 * shadowed / unshadowed light.
+	// Weather outputs and inputs, GPU format R8: sky factor (0 = covered,
+	// else 1 + 254 * factor), fog code, flash level, and 1 where a rain
+	// or snow drop was painted.
+	std::vector<uint8_t>              sky_levels;
+	std::vector<uint8_t>              fog_codes;
+	std::vector<uint8_t>              flash_levels;
+	std::vector<uint8_t>              particle_mask;
 	// Octahedral unit normal (Shaded_encode_normal), where facing is
 	// shaded_face_rounded; 0 elsewhere.  GPU format RG8_SNORM.
 	std::vector<uint16_t>             normal_map;
@@ -893,15 +931,26 @@ namespace Shaded_cpu {
 	// like the buffers).  Bins as from build_bins.  With shadows, each
 	// light but the self-light is scaled by 1 - strength * (1 - Ts * Tg)
 	// and shadow_out (if not null) gets 255 * shadowed / unshadowed light.
+	// With weather, the ambient (sky) term of a recorded pixel is dimmed
+	// by the clouds over it as far as it is open to the sky, and wout's
+	// buffers (those not null) get the weather outputs.
 	void light_rows(
 			const Shaded_scene_buffers& buf, const Shaded_light_params& params, const Shaded_light_record* lights,
 			const uint32_t* bin_offsets, const uint16_t* bin_lights, const Shaded_rect& r, int y0, int y1,
-			uint8_t* levels, const Shaded_shadow_set* shadows = nullptr, uint8_t* shadow_out = nullptr);
+			uint8_t* levels, const Shaded_shadow_set* shadows = nullptr, uint8_t* shadow_out = nullptr,
+			const Shaded_weather_set* weather = nullptr, const Shaded_weather_out* wout = nullptr);
 	// Relight rows [y0, y1) of r of an 8-bit frame (indexed like the
 	// buffers): frame[i] = remap[levels[i] * 256 + frame[i]].
 	void apply_light_rows(
 			const Shaded_scene_buffers& buf, const Shaded_rect& r, int y0, int y1, const uint8_t* levels,
 			const uint8_t* remap, unsigned char* frame);
+	// apply_light_rows, then the flash row of flash_table (8 rows of 256)
+	// and the fog row of fog_table (64 rows of 256) for each pixel's codes;
+	// a null table (or code 0) leaves the pixel as remapped.
+	void apply_weather_rows(
+			const Shaded_scene_buffers& buf, const Shaded_rect& r, int y0, int y1, const uint8_t* levels,
+			const uint8_t* remap, const uint8_t* fog_codes, const uint8_t* fog_table, const uint8_t* flash_levels,
+			const uint8_t* flash_table, unsigned char* frame);
 	// Relight rows [y0, y1) of r of an 8-bit frame at one light level,
 	// dithered against world pixels as light_rows does for unlit pixels.
 	void apply_level_rows(
@@ -965,7 +1014,18 @@ public:
 		return lighting_on && params.shadows != 0;
 	}
 
-	// Palettes lighting works over: DUSK/DAWN, NIGHT and SPELL.
+	// Lighting is on and so is weather lighting (the grid then runs too).
+	bool weather_wanted() const {
+		return lighting_on && params.weather != 0;
+	}
+
+	// Clouds show as patches of reduced sky light, not as sprites.
+	bool cloud_shadows_shown() const {
+		return weather_wanted() && params.cloud_shadows > 0.0f && lit_active;
+	}
+
+	// Palettes lighting works over: DUSK/DAWN, NIGHT and SPELL, and with
+	// weather lighting OVERCAST, and DAY while there is weather.
 	static bool lightable_palette(int n);
 	// Called by Palette for the colours it is about to display: palnum is
 	// its palettes.flx number (-1 = none), world is set when the palette was
@@ -1101,7 +1161,7 @@ private:
 	std::vector<std::vector<uint8_t>>  ref_pals;    // shaded_ref_palettes, 768 each.
 	std::string                        refs_game;    // Game the refs were read for.
 	uint64_t                           lit_hash    = 0;    // Light hash of the last lit paint.
-	float                              lit_sliders[11]{};    // Sliders of the last lit paint.
+	std::array<float, 23>              lit_sliders{};    // Sliders of the last lit paint.
 	int                                lit_grid    = -1;    // Grid generation of the last lit paint.
 	std::vector<unsigned char>         unlit_frame;    // Frame before the pass, for dumps.
 	long                               relit_pixels = 0;
@@ -1140,6 +1200,28 @@ private:
 	long long                                  shadow_paints = 0;
 	int                                        field_generation = -1;    // Grid generation of field_cache.
 	std::string                                shadow_info;    // For the dump info.
+	// Weather: what the effects reported, the pass's inputs, and caches.
+	// (Held by pointer: shadedweather.h includes this header.)
+	std::unique_ptr<Shaded_weather_input> weather_input;
+	std::unique_ptr<Shaded_weather_set>   weather_set;    // Sky map, clouds and masks.
+	bool                 weather_set_on       = false;    // This paint's pass used it.
+	bool                 weather_present      = false;    // Clouds or fog now (last gather).
+	bool                 last_weather_present = false;
+	float                overcast_target      = 0.0f;    // 1 while the world palette is OVERCAST.
+	float                shadow_strength_config = 1.0f;    // Before the overcast softening.
+	float                shadow_softness_config = 1.0f;
+	uint64_t             cloud_hash      = 0;
+	uint64_t             lit_cloud_hash  = 0;
+	int                  open_generation = -1;    // What the sky map was built for.
+	int                  open_origin_tx = 0, open_origin_ty = 0, open_size_x = 0, open_size_y = 0;
+	float                open_fade = -1.0f;
+	std::unordered_map<const Shape_frame*, int32_t> cloud_mask_cache;    // Frame to index in weather_set.masks.
+	int                  cloud_mask_blur = -1;    // Blur of the cached masks.
+	std::string          cloud_mask_game;
+	bool                 weather_test       = false;    // EXULT_SHADED_WEATHER_TEST.
+	bool                 weather_test_done  = false;
+	int                  dump_flash         = 0;    // EXULT_SHADED_DUMP_FLASH (lightning).
+	std::string          weather_info;    // For the dump info.
 	// Headless debug hooks (EXULT_SHADED_HOUR, EXULT_SHADED_TELEPORT).
 	int  pending_hour     = -1;
 	bool pending_teleport = false;
@@ -1171,6 +1253,7 @@ private:
 	double            full_shadow_us     = 0;
 	double            shadow_field_us    = 0;    // Totals over all passes.
 	double            shadow_screen_us   = 0;
+	double            weather_prep_us    = 0;    // Sky maps and cloud masks, all paints.
 	long long         shadow_cache_hits  = 0;
 	Clock::time_point last_report;
 	int               game_width     = 0;    // Of the last full paint.
@@ -1191,12 +1274,17 @@ private:
 						  const Game_object& source, const Game_object& owner, const Shaded_light_entry& entry,
 						  Shaded_light_row row, bool carried);
 	void               shift(int dx, int dy);
+	std::array<float, 23> slider_values() const;
+	bool               prepare_weather();
+	void               prepare_weather_pass();
 	int                light_pass(
 					   const Shaded_rect& r, uint8_t* levels, bool threaded, unsigned char* frame = nullptr,
-					   const Shaded_shadow_set* shadows = nullptr, uint8_t* shadow_out = nullptr);
+					   const Shaded_shadow_set* shadows = nullptr, uint8_t* shadow_out = nullptr,
+					   const Shaded_weather_set* weather = nullptr, const Shaded_weather_out* wout = nullptr);
 	void               run_bands(int bands, const std::function<void(int)>& job);
 	bool               shadow_pass(const Shaded_rect& r, Shaded_shadow_set& set, bool threaded, bool use_cache, Shadow_stats& stats);
 	void               check_shadows(const Shaded_rect& r);
+	void               check_weather(const Shaded_rect& r);
 	bool               load_refs();
 	void               set_lit(bool on);
 	void               build_lut(uint8_t* lut) const;

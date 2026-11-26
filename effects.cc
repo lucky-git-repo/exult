@@ -40,6 +40,7 @@
 #include "gamemap.h"
 #include "gamewin.h"
 #include "ignore_unused_variable_warning.h"
+#include "shadedweather.h"
 #include "shapeinf.h"
 #include "ucmachine.h"
 #include "weaponinf.h"
@@ -429,6 +430,22 @@ void Effects_manager::paint() {
 	for (auto& effect : effects) {
 		effect->paint();
 	}
+}
+
+/**
+ *  Report the weather shown to shaded light.
+ */
+
+void Effects_manager::get_shaded_weather(Shaded_weather_input& in) const {
+	for (const auto& effect : effects) {
+		if (effect->is_weather()) {
+			static_cast<const Weather_effect*>(effect.get())->add_shaded_weather(in);
+		}
+	}
+}
+
+void Weather_effect::add_shaded_weather(Shaded_weather_input& in) const {
+	ignore_unused_variable_warning(in);
 }
 
 /**
@@ -1899,6 +1916,16 @@ void Cloud::paint() {
 }
 
 /**
+ *  Report the cloud where it would be painted.
+ */
+
+void Cloud::add_shaded_weather(Shaded_weather_input& in) const {
+	if (count > 0) {    // Might not have been started.
+		in.clouds.push_back(Shaded_cloud_source{wx, wy, cloud.get_shape()});
+	}
+}
+
+/**
  *  Create a few clouds to float across the screen.
  */
 
@@ -1965,10 +1992,25 @@ void Clouds_effect::handle_event(
  */
 
 void Clouds_effect::paint() {
+	// Shaded light shows the clouds as their shadows in the sky light.
+	if (Shaded_light::get().cloud_shadows_shown()) {
+		return;
+	}
 	if (!gwin->is_main_actor_inside() && !gumpman->showing_gumps(true)) {
 		for (auto& cloud : clouds) {
 			cloud->paint();
 		}
+	}
+}
+
+/**
+ *  Report the clouds to shaded light.
+ */
+
+void Clouds_effect::add_shaded_weather(Shaded_weather_input& in) const {
+	in.clouds_effect = true;
+	for (const auto& cloud : clouds) {
+		cloud->add_shaded_weather(in);
 	}
 }
 
