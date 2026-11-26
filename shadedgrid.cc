@@ -39,6 +39,7 @@
 #include "objiter.h"
 #include "objs.h"
 #include "shadedgrid_data.h"
+#include "shadedlight.h"
 #include "shapeinf.h"
 #include "tqueue.h"
 #include "utils.h"
@@ -58,10 +59,6 @@
 #include <random>
 #include <set>
 #include <sstream>
-
-#ifdef HAVE_PNG_H
-#	include <png.h>
-#endif
 
 /*
  *  Fires the headless dumps and tests (udata 0) and polls door probes in
@@ -322,40 +319,9 @@ namespace {
 	};
 
 #ifdef HAVE_PNG_H
-	// Write an 8-bit RGB image as a PNG.  (Shaded_light has the same
-	// writer, file-static; to be shared when the stages are merged.)
+	// Write an 8-bit RGB image as a PNG.
 	bool Write_png(const std::string& path, const Rgb_image& img) {
-		FILE* fp = fopen(path.c_str(), "wb");
-		if (!fp) {
-			return false;
-		}
-		png_structp png  = png_create_write_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
-		png_infop   info = png ? png_create_info_struct(png) : nullptr;
-		if (!png || !info) {
-			png_destroy_write_struct(&png, &info);
-			fclose(fp);
-			return false;
-		}
-		if (setjmp(png_jmpbuf(png))) {
-			png_destroy_write_struct(&png, &info);
-			fclose(fp);
-			return false;
-		}
-		png_init_io(png, fp);
-		png_set_IHDR(
-				png, info, static_cast<png_uint_32>(img.w), static_cast<png_uint_32>(img.h), 8, PNG_COLOR_TYPE_RGB,
-				PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT, PNG_FILTER_TYPE_DEFAULT);
-		png_write_info(png, info);
-		const size_t                 row_bytes = static_cast<size_t>(img.w) * 3;
-		std::vector<png_const_bytep> rows(static_cast<size_t>(img.h));
-		for (int y = 0; y < img.h; y++) {
-			rows[static_cast<size_t>(y)] = img.data.data() + static_cast<size_t>(y) * row_bytes;
-		}
-		png_write_rows(png, const_cast<png_bytepp>(rows.data()), static_cast<png_uint_32>(img.h));
-		png_write_end(png, info);
-		png_destroy_write_struct(&png, &info);
-		fclose(fp);
-		return true;
+		return Shaded_write_png(path, img.w, img.h, false, img.data);
 	}
 #endif
 

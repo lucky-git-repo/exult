@@ -591,4 +591,9 @@ private:
 	void           report_timing() const;
 };
 
+// Writes 8-bit RGB (or 16-bit big-endian grey) rows as a PNG; false on
+// failure or when built without PNG support.
+bool Shaded_write_png(
+		const std::string& path, int w, int h, bool grey16, const std::vector<unsigned char>& data);
+
 #endif

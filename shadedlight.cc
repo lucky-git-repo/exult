@@ -300,43 +300,6 @@ namespace {
 		}
 	};
 
-#ifdef HAVE_PNG_H
-	// Write rows of 8-bit RGB (or 16-bit big-endian grey) as a PNG.
-	bool Write_png(const std::string& path, int w, int h, bool grey16, const std::vector<unsigned char>& data) {
-		FILE* fp = fopen(path.c_str(), "wb");
-		if (!fp) {
-			return false;
-		}
-		png_structp png  = png_create_write_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
-		png_infop   info = png ? png_create_info_struct(png) : nullptr;
-		if (!png || !info) {
-			png_destroy_write_struct(&png, &info);
-			fclose(fp);
-			return false;
-		}
-		if (setjmp(png_jmpbuf(png))) {
-			png_destroy_write_struct(&png, &info);
-			fclose(fp);
-			return false;
-		}
-		png_init_io(png, fp);
-		png_set_IHDR(
-				png, info, static_cast<png_uint_32>(w), static_cast<png_uint_32>(h), grey16 ? 16 : 8,
-				grey16 ? PNG_COLOR_TYPE_GRAY : PNG_COLOR_TYPE_RGB, PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT,
-				PNG_FILTER_TYPE_DEFAULT);
-		png_write_info(png, info);
-		const size_t                row_bytes = static_cast<size_t>(w) * (grey16 ? 2 : 3);
-		std::vector<png_const_bytep> rows(static_cast<size_t>(h));
-		for (int y = 0; y < h; y++) {
-			rows[static_cast<size_t>(y)] = data.data() + static_cast<size_t>(y) * row_bytes;
-		}
-		png_write_rows(png, const_cast<png_bytepp>(rows.data()), static_cast<png_uint_32>(h));
-		png_write_end(png, info);
-		png_destroy_write_struct(&png, &info);
-		fclose(fp);
-		return true;
-	}
-#endif
 
 	using Light_table = std::map<std::pair<int, int>, Shaded_light_entry>;
 
@@ -403,6 +366,51 @@ namespace {
 		return "default";
 	}
 }    // namespace
+
+/*
+ *  Writes rows of 8-bit RGB (or 16-bit big-endian grey) as a PNG.  Returns
+ *  false on failure or without PNG support.
+ */
+bool Shaded_write_png(
+		const std::string& path, int w, int h, bool grey16, const std::vector<unsigned char>& data) {
+#ifdef HAVE_PNG_H
+	FILE* fp = fopen(path.c_str(), "wb");
+	if (!fp) {
+		return false;
+	}
+	png_structp png  = png_create_write_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
+	png_infop   info = png ? png_create_info_struct(png) : nullptr;
+	if (!png || !info) {
+		png_destroy_write_struct(&png, &info);
+		fclose(fp);
+		return false;
+	}
+	if (setjmp(png_jmpbuf(png))) {
+		png_destroy_write_struct(&png, &info);
+		fclose(fp);
+		return false;
+	}
+	png_init_io(png, fp);
+	png_set_IHDR(
+			png, info, static_cast<png_uint_32>(w), static_cast<png_uint_32>(h), grey16 ? 16 : 8,
+			grey16 ? PNG_COLOR_TYPE_GRAY : PNG_COLOR_TYPE_RGB, PNG_INTERLACE_NONE, PNG_COMPRESSION_TYPE_DEFAULT,
+			PNG_FILTER_TYPE_DEFAULT);
+	png_write_info(png, info);
+	const size_t                row_bytes = static_cast<size_t>(w) * (grey16 ? 2 : 3);
+	std::vector<png_const_bytep> rows(static_cast<size_t>(h));
+	for (int y = 0; y < h; y++) {
+		rows[static_cast<size_t>(y)] = data.data() + static_cast<size_t>(y) * row_bytes;
+	}
+	png_write_rows(png, const_cast<png_bytepp>(rows.data()), static_cast<png_uint_32>(h));
+	png_write_end(png, info);
+	png_destroy_write_struct(&png, &info);
+	fclose(fp);
+	return true;
+#else
+	ignore_unused_variable_warning(path, w, h, grey16, data);
+	return false;
+#endif
+}
 
 Shaded_rect Shaded_scene_buffers::bounds() const {
 	if (stride <= 0) {
@@ -1827,7 +1835,7 @@ void Shaded_light::dump(Image_window8& win, int number, bool view, bool full) {
 			}
 		}
 #ifdef HAVE_PNG_H
-		if (!Write_png(prefix + name + ".png", gw, gh, false, rgb)) {
+		if (!Shaded_write_png(prefix + name + ".png", gw, gh, false, rgb)) {
 			std::cout << "SHADED: could not write " << prefix << name << ".png" << std::endl;
 		}
 #else
@@ -1891,7 +1899,7 @@ void Shaded_light::dump(Image_window8& win, int number, bool view, bool full) {
 			grey[out + 1]      = static_cast<unsigned char>(h & 0xff);
 		}
 	}
-	if (!Write_png(prefix + "height16.png", gw, gh, true, grey)) {
+	if (!Shaded_write_png(prefix + "height16.png", gw, gh, true, grey)) {
 		std::cout << "SHADED: could not write " << prefix << "height16.png" << std::endl;
 	}
 	// Facts for checking the geometry: counts per face, and the avatar's
