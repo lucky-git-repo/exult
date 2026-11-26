@@ -680,6 +680,11 @@ namespace Shaded_cpu {
 	float palette_luminance(const uint8_t* pal768, const uint8_t* day768);
 	// Index in [first, last] of the colour of pal768 nearest (r, g, b).
 	int nearest_colour(const uint8_t* pal768, int r, int g, int b, int first, int last);
+	// CIELAB (D65) of a 6-bit sRGB colour.
+	void colour_lab(int r, int g, int b, float lab[3]);
+	// Index in [first, last] of the colour nearest lab, by CIELAB distance
+	// with lightness weighted 4: pal_lab holds colour_lab of each index.
+	int nearest_colour_lab(const float (*pal_lab)[3], const float lab[3], int first, int last);
 	// Remap tables (shaded_remap_size bytes) from the ambient palette and the
 	// reference palettes (DAY, CANDLE, SINGLE_LIGHT, MANY_LIGHTS), and the
 	// palette to display with them.  Sets params.ambient_level; the stops

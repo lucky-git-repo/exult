@@ -1220,6 +1220,45 @@ int Shaded_cpu::nearest_colour(const uint8_t* pal768, int r, int g, int b, int f
 	return best;
 }
 
+void Shaded_cpu::colour_lab(int r, int g, int b, float lab[3]) {
+	auto lin = [](int v) {
+		const float c = static_cast<float>(v) / 63.0f;
+		return c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f);
+	};
+	const float lr = lin(r), lg = lin(g), lb = lin(b);
+	const float x  = (0.4124f * lr + 0.3576f * lg + 0.1805f * lb) / 0.95047f;
+	const float y  = 0.2126f * lr + 0.7152f * lg + 0.0722f * lb;
+	const float z  = (0.0193f * lr + 0.1192f * lg + 0.9505f * lb) / 1.08883f;
+	auto        f  = [](float t) {
+        return t > 0.008856f ? std::cbrt(t) : 7.787f * t + 16.0f / 116.0f;
+	};
+	const float fx = f(x), fy = f(y), fz = f(z);
+	lab[0]         = 116.0f * fy - 16.0f;
+	lab[1]         = 500.0f * (fx - fy);
+	lab[2]         = 200.0f * (fy - fz);
+}
+
+int Shaded_cpu::nearest_colour_lab(const float (*pal_lab)[3], const float lab[3], int first, int last) {
+	int   best      = first;
+	float best_dist = std::numeric_limits<float>::max();
+	for (int i = first; i <= last; i++) {
+		const float dl   = lab[0] - pal_lab[i][0];
+		const float da   = lab[1] - pal_lab[i][1];
+		const float db   = lab[2] - pal_lab[i][2];
+		// Lightness weighted 4: hue stays close, and the ramp no more often
+		// steps darker as the light rises than with RGB distance.
+		const float dist = 4.0f * dl * dl + da * da + db * db;
+		if (dist < best_dist) {
+			best      = i;
+			best_dist = dist;
+			if (dist == 0.0f) {
+				break;
+			}
+		}
+	}
+	return best;
+}
+
 void Shaded_cpu::build_remap(
 		const uint8_t* ambient768, const uint8_t* const refs[4], Shaded_light_params& params, uint8_t* remap,
 		uint8_t* displayed768, Shaded_ramp* ramp) {
@@ -1250,6 +1289,13 @@ void Shaded_cpu::build_remap(
 		add_stop(shaded_ref_palettes[brighter[k].second], brighter[k].first, refs[brighter[k].second]);
 	}
 	add_stop(shaded_ref_palettes[0], 1.0f, day);
+	// Ramp colours are matched to DAY in CIELAB, lightness weighted 4: plain
+	// RGB distance turned DUSK/NIGHT olives and sea-greens and lit reds into
+	// DAY's greens and yellow-greens (green-tint.md).
+	float day_lab[shaded_last_lit_index + 1][3] = {};
+	for (int i = 1; i <= shaded_last_lit_index; i++) {
+		colour_lab(day[3 * i], day[3 * i + 1], day[3 * i + 2], day_lab[i]);
+	}
 	const int top = std::max(params.level_count - 1, 1);
 	for (int q = 0; q < shaded_light_levels; q++) {
 		const float l   = std::min(static_cast<float>(q) / static_cast<float>(top), 1.0f);
@@ -1270,7 +1316,9 @@ void Shaded_cpu::build_remap(
 				const float hi = colours[seg + 1] ? colours[seg + 1][3 * i + k] : 0.0f;
 				c[k]           = static_cast<int>(std::lround(lo + (hi - lo) * t));
 			}
-			row[i] = static_cast<uint8_t>(nearest_colour(day, c[0], c[1], c[2], 1, shaded_last_lit_index));
+			float lab[3];
+			colour_lab(c[0], c[1], c[2], lab);
+			row[i] = static_cast<uint8_t>(nearest_colour_lab(day_lab, lab, 1, shaded_last_lit_index));
 		}
 	}
 	// B': DAY for the relit indices, A's own cycling colours, DAY's 0xff.
