@@ -59,11 +59,14 @@ constexpr uint8_t shaded_face_ground  = 1;    // Flats, terrain, 0-height object
 constexpr uint8_t shaded_face_top     = 2;
 constexpr uint8_t shaded_face_south   = 3;    // Faces +y.
 constexpr uint8_t shaded_face_east    = 4;    // Faces +x.
-constexpr uint8_t shaded_face_rounded = 5;    // Reserved for rounded volumes.
+constexpr uint8_t shaded_face_rounded = 5;    // Rounded volume: the normal is in normal_map.
 constexpr uint8_t shaded_face_mask    = 0x07;
 // Set when the pixel lay outside the object's projected 3D box and its face
 // and height were clamped onto the box.
 constexpr uint8_t shaded_face_clamped = 0x08;
+// Set on a roof seam pixel merged into the slab top beside it
+// (Shaded_cpu::merge_roof_seams): it lies on that plane, not in its box.
+constexpr uint8_t shaded_face_merged = 0x10;
 
 // Height units per lift in the height buffer (one screen pixel = 1/4 lift).
 constexpr int shaded_height_units_per_lift = 16;
@@ -198,7 +201,7 @@ static_assert(std::is_trivially_copyable_v<Shaded_object_volume> && std::is_stan
 
 // Object flags (Shaded_scene_buffers::object_flags).
 constexpr uint8_t shaded_object_rounded = 1;    // Has a rounded volume.
-constexpr uint8_t shaded_object_roof    = 2;    // A roof slab (occludes, or a grid roof shape).
+constexpr uint8_t shaded_object_roof    = 2;    // A slab: occludes, a grid roof shape, or one lift high.
 
 // Light flags (Shaded_light_record::flags).  Area and off are also the
 // flags column of shaded_light.txt.
@@ -305,7 +308,7 @@ struct Shaded_scene_buffers {
 	int                               stride = 0;    // Elements per row.
 	int                               origin = 0;    // Index of game pixel (0, 0).
 	std::vector<uint16_t>             height_map;    // 1/16 lift above lift 0.
-	std::vector<uint8_t>              facing_map;    // shaded_face_* (+ clamped bit).
+	std::vector<uint8_t>              facing_map;    // shaded_face_* (+ clamped, merged bits).
 	std::vector<uint16_t>             object_ids;    // shaded_id_*.
 	std::vector<uint8_t>              light_levels;    // 0..level_count - 1.
 	std::vector<uint8_t>              shadow_levels;    // 255 * shadowed / unshadowed light.

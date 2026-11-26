@@ -730,8 +730,38 @@ void Shaded_cpu::build_silhouette(
 	if (bottom < 0) {
 		return;
 	}
-	auto opaque = [&](int x, int y) {
+	auto drawn = [&](int x, int y) {
 		return x >= 0 && y >= 0 && x < w && y < h && mask[static_cast<size_t>(y) * w + x] != 0;
+	};
+	// Close the gaps in the art (leaves, hair, armour) with a 2 pixel
+	// closing (dilate, then erode), so the bulge follows the outline and
+	// not every hole in it.  The margin keeps the grid's edge (which the
+	// transform counts as a source) away from the art.
+	std::vector<uint8_t> closed(size, 0);
+	{
+		constexpr int    m  = 6;
+		const int        cw = w + 2 * m;
+		const int        ch = h + 2 * m;
+		std::vector<int> grow(static_cast<size_t>(cw) * ch);
+		for (int y = 0; y < ch; y++) {
+			for (int x = 0; x < cw; x++) {
+				grow[static_cast<size_t>(y) * cw + x] = drawn(x - m, y - m) ? 0 : 1 << 28;
+			}
+		}
+		Chamfer_distance(grow, cw, ch);    // 3 x each cell's distance to the art.
+		for (int& v : grow) {
+			v = v <= 6 ? 1 << 28 : 0;    // Dilated: within 2 px of the art.
+		}
+		Chamfer_distance(grow, cw, ch);    // 3 x distance out of the dilated set.
+		for (int y = 0; y < h; y++) {
+			for (int x = 0; x < w; x++) {
+				closed[static_cast<size_t>(y) * w + x]
+						= drawn(x, y) || grow[static_cast<size_t>(y + m) * cw + x + m] > 6 ? 1 : 0;
+			}
+		}
+	}
+	auto opaque = [&](int x, int y) {
+		return x >= 0 && y >= 0 && x < w && y < h && closed[static_cast<size_t>(y) * w + x] != 0;
 	};
 	// A tree's crown is the top 60 % of its rows; the rest is its trunk.
 	const bool tree  = kind == Shaded_volume::tree;
@@ -812,7 +842,7 @@ void Shaded_cpu::build_silhouette(
 	const float  root2   = std::sqrt(2.0f);
 	for (int y = top; y <= bottom; y++) {
 		for (int x = 0; x < w; x++) {
-			if (!opaque(x, y)) {
+			if (!drawn(x, y)) {
 				continue;
 			}
 			const bool  in_crown = tree && y < split;
@@ -887,6 +917,71 @@ void Shaded_cpu::record_rounded(
 	});
 }
 
+void Shaded_cpu::merge_roof_seams(Shaded_scene_buffers& buf, const Shaded_rect& r, long& merged) {
+	const Shaded_rect area  = buf.bounds();
+	const int         count = static_cast<int>(std::min(buf.objects.size(), buf.object_flags.size()));
+	auto              roof  = [&](int id) {
+        return id != shaded_id_none && id != shaded_id_overflow && id <= count
+               && (buf.object_flags[id - 1] & shaded_object_roof) != 0;
+	};
+	auto inside = [&](int x, int y) {
+		return x >= area.x && y >= area.y && x < area.x + area.w && y < area.y + area.h;
+	};
+	// Decided on the record as painted, then written.
+	std::vector<std::pair<int, uint16_t>> seams;
+	for (int y = r.y; y < r.y + r.h; y++) {
+		for (int x = r.x; x < r.x + r.w; x++) {
+			const int     idx  = buf.index(x, y);
+			const uint8_t face = buf.facing_map[idx] & shaded_face_mask;
+			const int     id   = buf.object_ids[idx];
+			if ((face != shaded_face_south && face != shaded_face_east) || !roof(id)) {
+				continue;
+			}
+			// A south face runs down the screen (+y) from the slab's top
+			// edge, an east face across it (+x).
+			const int sx = face == shaded_face_east ? 1 : 0;
+			const int sy = 1 - sx;
+			auto      same = [&](int k) {
+                const int px = x + sx * k;
+                const int py = y + sy * k;
+                if (!inside(px, py)) {
+                    return false;
+                }
+                const int i = buf.index(px, py);
+                return (buf.facing_map[i] & shaded_face_mask) == face && buf.object_ids[i] == id;
+			};
+			int before = 0, after = 0;
+			while (before < 5 && same(-(before + 1))) {
+				before++;
+			}
+			while (after < 5 && same(after + 1)) {
+				after++;
+			}
+			if (before + after + 1 > 4) {
+				continue;    // A real wall of the slab, not a seam.
+			}
+			const int px = x + sx * (after + 1);
+			const int py = y + sy * (after + 1);
+			if (!inside(px, py)) {
+				continue;
+			}
+			const int                   next  = buf.index(px, py);
+			const int                   other = buf.object_ids[next];
+			const Shaded_object_record& o     = buf.objects[id - 1];
+			const int                   top   = std::min((o.tz + o.ztiles) * shaded_height_units_per_lift, 0xffff);
+			if ((buf.facing_map[next] & shaded_face_mask) == shaded_face_top && other != id && roof(other)
+				&& std::abs(buf.height_map[next] - top) <= 4) {
+				seams.emplace_back(idx, static_cast<uint16_t>(top));
+			}
+		}
+	}
+	for (const auto& [idx, top] : seams) {
+		buf.facing_map[idx] = shaded_face_top | shaded_face_merged;
+		buf.height_map[idx] = top;
+	}
+	merged += static_cast<long>(seams.size());
+}
+
 int Shaded_cpu::view_code(const Shaded_scene_buffers& buf, const Shaded_light_params& params, int index) {
 	const uint8_t facing = buf.facing_map[index];
 	switch (static_cast<Shaded_view>(params.view)) {
@@ -911,7 +1006,18 @@ int Shaded_cpu::view_code(const Shaded_scene_buffers& buf, const Shaded_light_pa
 		return 1 + buf.light_levels[index] * (lut_size - 2) / std::max(params.level_count - 1, 1);
 	case Shaded_view::shadow:
 		return 1 + buf.shadow_levels[index] * (lut_size - 2) / 255;
-	case Shaded_view::normals:
+	case Shaded_view::normals: {
+		// 4 levels per channel: code = 16 r + 4 g + b.
+		const uint8_t face = facing & shaded_face_mask;
+		if (face == shaded_face_none) {
+			return 0;
+		}
+		const Shaded_normalf n = Shaded_pixel_normal(buf, index, face);
+		auto                 q = [](float c) {
+            return std::clamp(static_cast<int>((c * 0.5f + 0.5f) * 4.0f), 0, 3);
+		};
+		return std::max(16 * q(n.x) + 4 * q(n.y) + q(n.z), 1);
+	}
 	case Shaded_view::normal:
 	case Shaded_view::unlit:
 	case Shaded_view::count:
@@ -2561,6 +2667,14 @@ void Shaded_light::end_paint(Image_window8& win, bool full) {
 	if (!was_active) {
 		return;
 	}
+	if (params.rounded && params.roof_seams) {
+		switch (backend()) {
+		case Shaded_backend::gpu:    // backend() falls back to CPU.
+		case Shaded_backend::cpu:
+			Shaded_cpu::merge_roof_seams(buffers, clip, seam_pixels);
+			break;
+		}
+	}
 	params.object_count = static_cast<int32_t>(buffers.objects.size());
 	finish_due          = true;
 }
@@ -3201,7 +3315,12 @@ void Shaded_light::begin_object(const Game_object& obj, int ox, int oy) {
 			t.tx, t.ty, t.tz, info.get_3d_xtiles(frame), info.get_3d_ytiles(frame), info.get_3d_height(), obj.get_shapenum(), frame};
 	const Shaded_volume volume  = volume_for(obj);
 	const uint8_t       opacity = Screen_opacity(obj, info, frame, volume);
-	const uint8_t       flags   = volume != Shaded_volume::box ? shaded_object_rounded : 0;
+	const Shaded_grid*  grid    = Shaded_grid::active;
+	const bool          roof    = params.rounded && params.roof_seams
+							&& (info.occludes() || rec.ztiles == 1
+								|| (grid && (grid->get_rules().lookup(obj.get_shapenum(), frame).flags & shaded_cell_roof)));
+	const uint8_t       flags   = static_cast<uint8_t>(
+            (volume != Shaded_volume::box ? shaded_object_rounded : 0) | (roof ? shaded_object_roof : 0));
 	auto [it, inserted]         = object_index.try_emplace(&obj, shaded_id_overflow);
 	if (inserted && buffers.objects.size() < shaded_id_overflow - 1) {
 		buffers.objects.push_back(rec);
@@ -3386,6 +3505,10 @@ void Shaded_light::build_lut(uint8_t* lut) const {
 			}
 			break;
 		case Shaded_view::normals:
+			if (code > 0) {
+				col = Rgb{((code >> 4) & 3) * 85, ((code >> 2) & 3) * 85, (code & 3) * 85};
+			}
+			break;
 		case Shaded_view::normal:
 		case Shaded_view::unlit:
 		case Shaded_view::count:
@@ -3470,7 +3593,26 @@ void Shaded_light::dump(Image_window8& win, int number, bool view, bool full) {
 				static_cast<float>(buffers.height_map[idx]) / params.height_units_per_lift / params.debug_height_range);
 	});
 	image("facing", [&](int idx) {
-		return Facing_colour(buffers.facing_map[idx]);
+		const uint8_t facing = buffers.facing_map[idx];
+		Rgb           col    = Facing_colour(facing);
+		if ((facing & shaded_face_mask) == shaded_face_rounded) {
+			// Rounded: brighter where the surface faces up.
+			const float shade = 0.5f + 0.5f * Shaded_decode_normal(buffers.normal_map[idx]).z;
+			col               = Rgb{static_cast<int>(static_cast<float>(col.r) * shade), static_cast<int>(static_cast<float>(col.g) * shade),
+									static_cast<int>(static_cast<float>(col.b) * shade)};
+		}
+		return col;
+	});
+	image("normals", [&](int idx) {
+		const uint8_t face = buffers.facing_map[idx] & shaded_face_mask;
+		if (face == shaded_face_none) {
+			return Rgb{0, 0, 0};
+		}
+		const Shaded_normalf n = Shaded_pixel_normal(buffers, idx, face);
+		auto                 c = [](float v) {
+            return std::clamp(static_cast<int>(std::lround((v * 0.5f + 0.5f) * 255.0f)), 0, 255);
+		};
+		return Rgb{c(n.x), c(n.y), c(n.z)};
 	});
 	image("id", [&](int idx) {
 		return Id_colour(buffers.object_ids[idx]);
@@ -3535,7 +3677,8 @@ void Shaded_light::dump(Image_window8& win, int number, bool view, bool full) {
 				rounded_px++;
 				rounded_outside += in(e.body) || in(e.crown) ? 0 : 1;
 			}
-			if (id != shaded_id_none && id != shaded_id_overflow && !rounded && !(buffers.facing_map[idx] & shaded_face_clamped)) {
+			if (id != shaded_id_none && id != shaded_id_overflow && !rounded
+				&& !(buffers.facing_map[idx] & (shaded_face_clamped | shaded_face_merged))) {
 				// Rebuilt position must lie in the object's box (within
 				// half a pixel; world x/y wrap is ignored here).
 				const Shaded_object_record& o = buffers.objects[id - 1];
@@ -3569,6 +3712,10 @@ void Shaded_light::dump(Image_window8& win, int number, bool view, bool full) {
 			}
 		}
 	}
+	long kinds[shaded_volume_kinds] = {};    // Fitted volumes by kind.
+	for (const Shaded_object_volume& v : buffers.object_volumes) {
+		kinds[std::clamp(v.kind, 0, shaded_volume_kinds - 1)]++;
+	}
 	std::ofstream info(prefix + "info.txt");
 	info << "game " << gw << "x" << gh << "\n"
 		 << "paint " << (full ? "full" : "partial (frame outside its clip may hold earlier sprites or text)") << "\n"
@@ -3581,7 +3728,13 @@ void Shaded_light::dump(Image_window8& win, int number, bool view, bool full) {
 		 << faces[shaded_face_top] << " south " << faces[shaded_face_south] << " east " << faces[shaded_face_east] << "\n"
 		 << "object pixels (unclamped) " << box_px << " rebuilt outside their box " << box_outside << ", clamped "
 		 << clamped_px << "\n"
+		 << "rounded " << (params.rounded ? "on" : "off") << " seams " << (params.rounded && params.roof_seams ? "on" : "off")
+		 << "\n"
 		 << "pixels rounded " << rounded_px << "\n"
+		 << "seam pixels merged " << seam_pixels << " (last paint)\n"
+		 << "clamped " << clamped_px << "\n"
+		 << "rounded objects " << kinds[1] + kinds[2] + kinds[3] + kinds[4] << " (figure " << kinds[1] << " round " << kinds[2]
+		 << " upright " << kinds[3] << " tree " << kinds[4] << ")\n"
 		 << "rounded pixels rebuilt outside their fitted volume " << rounded_outside << "\n";
 	if (main_actor_id != shaded_id_none && main_actor_id != shaded_id_overflow) {
 		const Shaded_object_record& a = buffers.objects[main_actor_id - 1];
