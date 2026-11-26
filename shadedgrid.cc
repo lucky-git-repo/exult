@@ -739,6 +739,10 @@ Shaded_grid::Shaded_grid() {
 	if (config) {
 		config->value("config/video/shaded_light_grid", enabled, false);
 	}
+	// Traced shadows need the grid.
+	if (Shaded_light::get().shadows_wanted()) {
+		enabled = true;
+	}
 	if (const char* dir = std::getenv("EXULT_SHADED_GRID_DUMP"); dir && *dir) {
 		dump_dir = dir;
 		std::error_code ec;

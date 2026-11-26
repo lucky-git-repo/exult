@@ -74,8 +74,9 @@ enum class Shaded_view : int32_t {
 	height,
 	facing,
 	object_id,
-	light,    // Light level as a grey ramp.
-	unlit,    // The frame without the light pass.
+	light,     // Light level as a grey ramp.
+	unlit,     // The frame without the light pass.
+	shadow,    // Shadowed share of the light as a grey ramp.
 	count
 };
 
@@ -135,6 +136,15 @@ struct alignas(16) Shaded_light_params {
 	int32_t bins_x   = 0;
 	int32_t bins_y   = 0;
 	int32_t threads  = 0;    // Threads of the light pass (0 = auto until set up).
+	// Traced shadows.
+	int32_t shadows           = 1;     // On.
+	int32_t shadow_resolution = 2;     // Pixels per side of a screen map cell: 1, 2 or 4.
+	int32_t shadow_lights     = 4;     // Lights traced per map cell, 1..16.
+	int32_t shadow_steps      = 32;    // Most samples of a screen-space trace.
+	float   shadow_strength   = 1.0f;     // 0 = no shadows, 1 = full.
+	float   shadow_softness   = 1.0f;     // 1 = light size 0.5 tile, 0 = hard edges.
+	float   shadow_bias       = 0.25f;    // Tiles skipped at the receiver.
+	float   shadow_reserved   = 0.0f;
 };
 
 static_assert(sizeof(Shaded_light_params) % 16 == 0);
@@ -156,6 +166,9 @@ static_assert(sizeof(Shaded_object_record) == 32);
 constexpr int32_t shaded_light_area    = 1;    // Even light, horizontal distance.
 constexpr int32_t shaded_light_off     = 2;    // Gives no shaded light.
 constexpr int32_t shaded_light_carried = 4;    // Readied by a party member.
+// Reserved for the sun and moon (never set yet): x, y and z then hold the
+// direction towards the light, in tiles, tiles and lifts per unit.
+constexpr int32_t shaded_light_directional = 8;
 // Most lights in one paint.
 constexpr int shaded_max_lights = 256;
 
@@ -176,6 +189,40 @@ struct Shaded_light_record {
 
 static_assert(sizeof(Shaded_light_record) == 48);
 static_assert(std::is_trivially_copyable_v<Shaded_light_record> && std::is_standard_layout_v<Shaded_light_record>);
+
+/*
+ *  A world point: tiles, tiles, lifts.
+ */
+struct Shaded_point {
+	float x, y, z;
+};
+
+// Shortest way round the wrapped world for a difference of two positions
+// in [0, c_num_tiles) plus a screen or two.
+constexpr float Shaded_wrap_delta(float d) {
+	const auto tiles = static_cast<float>(c_num_tiles);
+	if (d > tiles * 0.5f) {
+		return d - tiles;
+	}
+	if (d < -tiles * 0.5f) {
+		return d + tiles;
+	}
+	return d;
+}
+
+/*
+ *  Where the shadow traces from p end: a point light's position, in p's
+ *  frame of the wrapped world; for a directional light (sun, moon) a point
+ *  64 units along its direction, to be gated by Shaded_grid open_to_sky.
+ */
+constexpr Shaded_point Shaded_shadow_target(const Shaded_light_record& l, const Shaded_point& p) {
+	switch (l.flags & shaded_light_directional) {
+	case shaded_light_directional:
+		return Shaded_point{p.x + l.x * 64.0f, p.y + l.y * 64.0f, p.z + l.z * 64.0f};
+	default:
+		return Shaded_point{p.x + Shaded_wrap_delta(l.x - p.x), p.y + Shaded_wrap_delta(l.y - p.y), l.z};
+	}
+}
 
 /*
  *  One row of shaded_light.txt.
@@ -222,7 +269,9 @@ struct Shaded_scene_buffers {
 	std::vector<uint8_t>              facing_map;    // shaded_face_* (+ clamped bit).
 	std::vector<uint16_t>             object_ids;    // shaded_id_*.
 	std::vector<uint8_t>              light_levels;    // 0..level_count - 1.
+	std::vector<uint8_t>              shadow_levels;    // 255 * shadowed / unshadowed light.
 	std::vector<Shaded_object_record> objects;
+	std::vector<uint8_t>              object_opacity;    // Per object: screen-space shadow opacity.
 	// Light bins: the lights reaching bin b are
 	// bin_lights[bin_offsets[b] .. bin_offsets[b + 1]).
 	std::vector<uint32_t> bin_offsets;
@@ -407,6 +456,11 @@ namespace Shaded_cpu {
 			uint8_t* displayed768, Shaded_ramp* ramp);
 }    // namespace Shaded_cpu
 
+// Which parts of the shadows are traced (EXULT_SHADED_SHADOW_PARTS).
+constexpr int shaded_shadow_parts_both   = 0;    // Screen space and grid.
+constexpr int shaded_shadow_parts_screen = 1;
+constexpr int shaded_shadow_parts_grid   = 2;
+
 class Shaded_workers;
 
 // Which volume an object uses.  Box for everything in stage 1; people,
@@ -438,6 +492,12 @@ public:
 	// Lighting relights the world this paint (night palettes).
 	bool lighting_active() const {
 		return lit_active;
+	}
+
+	// Lighting is on and so are traced shadows; the occlusion grid then
+	// turns itself on.
+	bool shadows_wanted() const {
+		return lighting_on && params.shadows != 0;
 	}
 
 	// Palettes lighting works over: DUSK/DAWN, NIGHT and SPELL.
@@ -500,6 +560,11 @@ private:
 	bool                                             finish_due    = false;    // Recorded, finish_paint not run.
 	// Config (config/video/shaded_light/...); sliders in params.
 	bool lighting_on = false;
+	// Shadow switches for headless runs (EXULT_SHADED_SHADOW_CACHE, _PARTS,
+	// _GRID): caches on, which parts (shadow_parts_*), grid by rays.
+	bool shadow_cache    = true;
+	int  shadow_parts    = 0;
+	bool shadow_grid_ray = false;
 	// Light pass workers (params.threads - 1 of them, made when needed).
 	std::unique_ptr<Shaded_workers> workers;
 	std::string                     thread_check;    // For the dump info.

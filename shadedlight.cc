@@ -42,6 +42,7 @@
 #include "iwin8.h"
 #include "palette.h"
 #include "ready.h"
+#include "shadedgrid.h"
 #include "shapeinf.h"
 #include "utils.h"
 
@@ -365,6 +366,27 @@ namespace {
 		}
 		return "default";
 	}
+
+	// Screen map cell size: 1, 2 or 4 pixels.
+	int Shadow_resolution(int value) {
+		return value >= 4 ? 4 : (value >= 2 ? 2 : 1);
+	}
+
+	// How much an object stops light in the screen-space shadow trace:
+	// people fully (they are not in the grid); shapes the grid lets light
+	// through (glass, bars, canopy, open doors) not at all, as the grid
+	// already applies their share; other solid shapes with height fully.
+	uint8_t Screen_opacity(const Game_object& obj, const Shape_info& info, int frame) {
+		if (obj.as_actor()) {
+			return 255;
+		}
+		const Shaded_grid* grid  = Shaded_grid::active;
+		const int          shape = obj.get_shapenum();
+		if (grid && grid->get_rules().has_shape(shape) && grid->get_rules().lookup(shape, frame).percent > 0) {
+			return 0;
+		}
+		return info.is_solid() && info.get_3d_height() > 0 ? 255 : 0;
+	}
 }    // namespace
 
 /*
@@ -515,6 +537,8 @@ int Shaded_cpu::view_code(const Shaded_scene_buffers& buf, const Shaded_light_pa
 	}
 	case Shaded_view::light:
 		return 1 + buf.light_levels[index] * (lut_size - 2) / std::max(params.level_count - 1, 1);
+	case Shaded_view::shadow:
+		return 1 + buf.shadow_levels[index] * (lut_size - 2) / 255;
 	case Shaded_view::normal:
 	case Shaded_view::unlit:
 	case Shaded_view::count:
@@ -865,6 +889,27 @@ Shaded_light::Shaded_light() {
 	if (params.threads <= 0) {
 		params.threads = std::clamp(static_cast<int>(std::thread::hardware_concurrency()), 1, 8);
 	}
+	// Shadow overrides for comparison and timing runs.
+	if (const char* sh = std::getenv("EXULT_SHADED_SHADOWS"); sh && *sh) {
+		params.shadows = *sh != '0' ? 1 : 0;
+	}
+	if (const char* res = std::getenv("EXULT_SHADED_SHADOW_RES"); res && *res) {
+		params.shadow_resolution = Shadow_resolution(std::atoi(res));
+	}
+	if (const char* sl = std::getenv("EXULT_SHADED_SHADOW_LIGHTS"); sl && *sl) {
+		params.shadow_lights = std::clamp(std::atoi(sl), 1, 16);
+	}
+	if (const char* cache = std::getenv("EXULT_SHADED_SHADOW_CACHE"); cache && *cache) {
+		shadow_cache = *cache != '0';
+	}
+	if (const char* parts = std::getenv("EXULT_SHADED_SHADOW_PARTS"); parts && *parts) {
+		const std::string p(parts);
+		shadow_parts = p == "screen" ? shaded_shadow_parts_screen
+							   : (p == "grid" ? shaded_shadow_parts_grid : shaded_shadow_parts_both);
+	}
+	if (const char* grid = std::getenv("EXULT_SHADED_SHADOW_GRID"); grid && *grid) {
+		shadow_grid_ray = std::string(grid) == "ray";
+	}
 	const char* tim = std::getenv("EXULT_SHADED_TIMING");
 	timing          = tim && *tim && *tim != '0';
 	record_on       = enabled;
@@ -907,6 +952,8 @@ const char* Shaded_light::view_name(Shaded_view view) {
 		return "light";
 	case Shaded_view::unlit:
 		return "unlit";
+	case Shaded_view::shadow:
+		return "shadow";
 	case Shaded_view::normal:
 	case Shaded_view::count:
 		break;
@@ -952,6 +999,17 @@ void Shaded_light::read_config() {
 	int threads;
 	config->value(base + "threads", threads, 0);
 	params.threads = std::max(threads, 0);    // 0 = auto, resolved later.
+	bool shadows;
+	config->value(base + "shadows", shadows, true);
+	params.shadows         = shadows ? 1 : 0;
+	params.shadow_strength = std::min(percent("shadow_strength", 100), 1.0f);
+	params.shadow_softness = percent("shadow_softness", 100);
+	int shadow_lights;
+	config->value(base + "shadow_lights", shadow_lights, 4);
+	params.shadow_lights = std::clamp(shadow_lights, 1, 16);
+	int resolution;
+	config->value(base + "shadow_resolution", resolution, 2);
+	params.shadow_resolution = Shadow_resolution(resolution);
 }
 
 /*
@@ -1192,6 +1250,9 @@ bool Shaded_light::prepare_paint() {
 	if (!record_on && !lighting_on) {
 		return false;
 	}
+	if (shadows_wanted()) {
+		Shaded_grid::get();    // Turns itself on for the shadows.
+	}
 	run_debug_hooks();
 	load_table();
 	gather_lights();
@@ -1365,7 +1426,9 @@ bool Shaded_light::setup_buffers(Image_window8& win) {
 		buffers.facing_map.assign(count, shaded_face_none);
 		buffers.object_ids.assign(count, shaded_id_none);
 		buffers.light_levels.assign(count, 0);
+		buffers.shadow_levels.assign(count, 255);
 		buffers.objects.clear();
+		buffers.object_opacity.clear();
 		object_index.clear();
 		main_actor_id         = shaded_id_none;
 		need_full             = true;    // Nothing recorded outside this clip.
@@ -1396,6 +1459,7 @@ void Shaded_light::begin_paint(Image_window8& win, bool full) {
 	clip = Intersect(Shaded_rect{cx, cy, cw, ch}, buffers.bounds());
 	if (full) {
 		buffers.objects.clear();
+		buffers.object_opacity.clear();
 		object_index.clear();
 		main_actor_id = shaded_id_none;
 		need_full     = false;
@@ -1450,6 +1514,7 @@ void Shaded_light::shift(int dx, int dy) {
 		std::copy_n(buffers.facing_map.begin() + from, w, buffers.facing_map.begin() + to);
 		std::copy_n(buffers.object_ids.begin() + from, w, buffers.object_ids.begin() + to);
 		std::copy_n(buffers.light_levels.begin() + from, w, buffers.light_levels.begin() + to);
+		std::copy_n(buffers.shadow_levels.begin() + from, w, buffers.shadow_levels.begin() + to);
 	};
 	const int rows = area.h - std::abs(dy);
 	if (dy > 0 || (dy == 0 && dx > 0)) {    // Moving up or left: go forwards.
@@ -1465,6 +1530,7 @@ void Shaded_light::shift(int dx, int dy) {
 		std::vector<uint8_t>  f8(static_cast<size_t>(w));
 		std::vector<uint16_t> i16(static_cast<size_t>(w));
 		std::vector<uint8_t>  l8(static_cast<size_t>(w));
+		std::vector<uint8_t>  s8(static_cast<size_t>(w));
 		for (int r = 0; r < rows; r++) {
 			const int from = buffers.index(src_x, area.y + r);
 			const int to   = buffers.index(dst_x, area.y + r);
@@ -1472,10 +1538,12 @@ void Shaded_light::shift(int dx, int dy) {
 			std::copy_n(buffers.facing_map.begin() + from, w, f8.begin());
 			std::copy_n(buffers.object_ids.begin() + from, w, i16.begin());
 			std::copy_n(buffers.light_levels.begin() + from, w, l8.begin());
+			std::copy_n(buffers.shadow_levels.begin() + from, w, s8.begin());
 			std::copy(h16.begin(), h16.end(), buffers.height_map.begin() + to);
 			std::copy(f8.begin(), f8.end(), buffers.facing_map.begin() + to);
 			std::copy(i16.begin(), i16.end(), buffers.object_ids.begin() + to);
 			std::copy(l8.begin(), l8.end(), buffers.light_levels.begin() + to);
+			std::copy(s8.begin(), s8.end(), buffers.shadow_levels.begin() + to);
 		}
 	}
 }
@@ -1579,7 +1647,8 @@ void Shaded_light::finish_paint(Image_window8& win, bool full) {
 	// dumps; it relights the frame only while active and not viewing unlit.
 	const auto view  = static_cast<Shaded_view>(params.view);
 	const bool apply = lit_active && view != Shaded_view::unlit && remap.size() == shaded_remap_size;
-	const bool pass  = lit_active || view == Shaded_view::light || view == Shaded_view::unlit || due;
+	const bool pass  = lit_active || view == Shaded_view::light || view == Shaded_view::unlit
+					  || view == Shaded_view::shadow || due;
 	auto*      frame = static_cast<unsigned char*>(win.get_draw_surface()->pixels);
 	params.lit       = apply ? 1 : 0;
 	relit_pixels     = 0;
@@ -1683,12 +1752,15 @@ void Shaded_light::begin_object(const Game_object& obj, int ox, int oy) {
 	const Tile_coord        t     = obj.get_tile();
 	const Shaded_object_record rec{
 			t.tx, t.ty, t.tz, info.get_3d_xtiles(frame), info.get_3d_ytiles(frame), info.get_3d_height(), obj.get_shapenum(), frame};
-	auto [it, inserted] = object_index.try_emplace(&obj, shaded_id_overflow);
+	const uint8_t opacity = Screen_opacity(obj, info, frame);
+	auto [it, inserted]   = object_index.try_emplace(&obj, shaded_id_overflow);
 	if (inserted && buffers.objects.size() < shaded_id_overflow - 1) {
 		buffers.objects.push_back(rec);
+		buffers.object_opacity.push_back(opacity);
 		it->second = static_cast<uint16_t>(buffers.objects.size());
 	} else if (!inserted && it->second != shaded_id_overflow) {
-		buffers.objects[it->second - 1] = rec;    // Moved or changed frame.
+		buffers.objects[it->second - 1]        = rec;    // Moved or changed frame.
+		buffers.object_opacity[it->second - 1] = opacity;
 	}
 	object.ox          = ox;
 	object.oy          = oy;
@@ -1791,6 +1863,7 @@ void Shaded_light::build_lut(uint8_t* lut) const {
 			}
 			break;
 		case Shaded_view::light:
+		case Shaded_view::shadow:
 			if (code > 0) {
 				const int grey = (code - 1) * 255 / (lut_size - 2);
 				col            = Rgb{grey, grey, grey};
