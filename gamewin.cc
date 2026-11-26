@@ -1417,7 +1417,7 @@ bool Game_window::init_gamedat(bool create) {
  *  Output: 0 if error, already reported.
  */
 
-void Game_window::write(bool nopaint) {
+void Game_window::write(bool nopaint, bool map_save) {
 	// Lets just show a nice message on screen first
 
 	const int width       = get_width();
@@ -1440,7 +1440,7 @@ void Game_window::write(bool nopaint) {
 	write_npcs();              // Write out npc.dat.
 	usecode->write();          // Usecode.dat (party, global flags).
 	Notebook_gump::write();    // Write out journal.
-	write_gwin();              // Write our data.
+	write_gwin(map_save);      // Write our data.
 	write_saveinfo(!nopaint);
 }
 
@@ -1476,7 +1476,7 @@ void Game_window::read() {
  *  Output: 0 if error.
  */
 
-void Game_window::write_gwin() {
+void Game_window::write_gwin(bool map_save) {
 	OFileDataSource gout(GWINDAT);
 	// Start with scroll coords (in tiles).
 	gout.write2(get_scrolltx());
@@ -1498,7 +1498,11 @@ void Game_window::write_gwin() {
 	gout.write1(ambient_light ? 1 : 0);
 	gout.write1(combat ? 1 : 0);
 	gout.write1(infravision_active ? 1 : 0);
-	effects->write_weather(gout);
+	if (map_save) {
+		gout.write1(0);    // No weather in initgame.dat.
+	} else {
+		effects->write_weather(gout);
+	}
 	if (!gout.good()) {
 		throw file_write_exception(GWINDAT);
 	}
@@ -1609,7 +1613,7 @@ void Game_window::write_map() {
 			map->write_static();    // Write ifix, map files.
 		}
 	}
-	write();    // Write out to 'gamedat' too.
+	write(false, true);    // Write out to 'gamedat' too.
 	save_gamedat(PATCH_INITGAME, "Saved map");
 }
 
@@ -2940,8 +2944,12 @@ void Game_window::setup_game(bool map_editing) {
 	// Ensure time is stopped if map-editing.
 	time_stopped = map_editing ? -1 : 0;
 	// Weather from the savegame, before eggs can change it. The palette for
-	// it is set below.
-	effects->restore_weather();
+	// it is set below. Not when map-editing, like the eggs.
+	if (map_editing) {
+		effects->clear_saved_weather();
+	} else {
+		effects->restore_weather();
+	}
 	//+++++The below wasn't prev. done by ::read(), so maybe it should be
 	//+++++controlled by a 'first-time' flag.
 	// Want to activate first egg.

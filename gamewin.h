@@ -837,9 +837,11 @@ public:
 	/*
 	 *  Save/restore/startup:
 	 */
-	void write(bool nopaint = false);      // Write out to 'gamedat'.
+	// Write out to 'gamedat'. A map save (for initgame.dat) leaves out the
+	// weather, so new games don't start with it.
+	void write(bool nopaint = false, bool map_save = false);
 	void read();                           // Read in 'gamedat'.
-	void write_gwin();                     // Write gamedat/gamewin.dat.
+	void write_gwin(bool map_save = false);    // Write gamedat/gamewin.dat.
 	void read_gwin();                      // Read gamedat/gamewin.dat.
 	bool was_map_modified();               // Was any map modified?
 	void write_map();                      // Write map data to <PATCH> dir.
