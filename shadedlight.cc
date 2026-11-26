@@ -2234,6 +2234,12 @@ bool Shaded_light::shadow_pass(
 	if (use_cache) {
 		shadow_paints++;
 	}
+	// The generation is in every field key and only moves forward, so the
+	// fields of an older one can never be hit again.
+	if (use_fields && generation != field_generation) {
+		field_cache.clear();
+		field_generation = generation;
+	}
 	const Shaded_rect grown{r.x - 2 * res, r.y - 2 * res, r.w + 4 * res, r.h + 4 * res};
 	std::vector<Shadow_key> field_keys;    // Of the fields and maps built.
 	std::vector<Shadow_key> map_keys;

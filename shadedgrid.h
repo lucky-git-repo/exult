@@ -295,9 +295,11 @@ private:
 	bool               any_dirty = false;
 	bool               warned_cap = false;
 	int                dirty_x0 = 0, dirty_y0 = 0, dirty_x1 = -1, dirty_y1 = -1;
+	std::vector<uint8_t> slot_scratch;    // Old cells of the slot being rebuilt.
 	// Statistics.
 	long long clipped_cells   = 0;    // Above lift 15, last full build.
 	long long chunks_built    = 0;
+	long long chunks_unchanged = 0;    // Rebuilt to the same cells.
 	double    last_build_ms   = 0;    // Last sync that built something.
 	double    last_recentre_ms = 0;
 	int       last_built      = 0;
@@ -316,7 +318,7 @@ private:
 	Shaded_grid();
 	void desired_extent(int& cx0, int& cy0, int& w, int& h) const;
 	void recentre(int cx0, int cy0, int w, int h);
-	void build_slot(int sx, int sy);
+	bool build_slot(int sx, int sy);    // True when the cells changed.
 	void stamp_object(const Game_object& obj, int sx, int sy);
 	void mark_dirty(int world_tx, int world_ty);
 	void schedule();

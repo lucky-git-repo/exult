@@ -919,11 +919,30 @@ void Shaded_grid::stamp_object(const Game_object& obj, int sx, int sy) {
 	volume.stamp_box(x0, y0, t.tz, x1, y1, z1, static_cast<uint8_t>(opacity), flags);
 }
 
-void Shaded_grid::build_slot(int sx, int sy) {
-	Slot& slot = slots[static_cast<size_t>(sy * chunks_x + sx)];
+bool Shaded_grid::build_slot(int sx, int sy) {
+	Slot&      slot   = slots[static_cast<size_t>(sy * chunks_x + sx)];
+	const bool before = slot.built;
+	const int  bx0    = sx * chunk_tiles;
+	const int  by0    = sy * chunk_tiles;
+	const auto rows   = [&](const auto& visit) {
+		for (int z = 0; z < volume.size_z; z++) {
+			for (int y = by0; y < by0 + chunk_tiles; y++) {
+				visit(&volume.cells[volume.index(bx0, y, z)]);
+			}
+		}
+	};
+	// Keep the old cells of a rebuilt slot, to tell a real change from a
+	// dirty mark that left the cells as they were.
+	const size_t row_bytes = static_cast<size_t>(chunk_tiles) * 2;
+	slot_scratch.clear();
+	if (before) {
+		rows([&](const uint8_t* row) {
+			slot_scratch.insert(slot_scratch.end(), row, row + row_bytes);
+		});
+	}
 	slot.built = true;
 	slot.dirty = false;
-	volume.clear_block(sx * chunk_tiles, sy * chunk_tiles, chunk_tiles, chunk_tiles);
+	volume.clear_block(bx0, by0, chunk_tiles, chunk_tiles);
 	Game_map* map = Game_window::get_instance()->get_map();
 	// Footprints reach west and north out of their chunk, so the chunks to
 	// the east, south and south-east can reach into this one.
@@ -952,6 +971,17 @@ void Shaded_grid::build_slot(int sx, int sy) {
 		dirty_y1 = std::max(dirty_y1, sy * chunk_tiles + chunk_tiles - 1);
 	}
 	chunks_built++;
+	if (!before) {
+		return true;
+	}
+	bool   changed = false;
+	size_t offset  = 0;
+	rows([&](const uint8_t* row) {
+		changed = changed || !std::equal(row, row + row_bytes, slot_scratch.begin() + offset);
+		offset += row_bytes;
+	});
+	chunks_unchanged += changed ? 0 : 1;
+	return changed;
 }
 
 bool Shaded_grid::sync() {
@@ -991,14 +1021,15 @@ bool Shaded_grid::sync() {
 	if (changed) {
 		last_recentre_ms = std::chrono::duration<double, std::milli>(moved - start).count();
 	}
-	int built = 0;
+	int  built        = 0;
+	bool cells_change = false;
 	if (any_dirty) {
 		any_dirty = false;
 		for (int sy = 0; sy < chunks_y; sy++) {
 			for (int sx = 0; sx < chunks_x; sx++) {
 				const Slot& slot = slots[static_cast<size_t>(sy * chunks_x + sx)];
 				if (!slot.built || slot.dirty) {
-					build_slot(sx, sy);
+					cells_change = build_slot(sx, sy) || cells_change;
 					built++;
 				}
 			}
@@ -1007,8 +1038,11 @@ bool Shaded_grid::sync() {
 	if (built) {
 		last_build_ms = std::chrono::duration<double, std::milli>(Clock::now() - moved).count();
 		last_built    = built;
-		changed       = true;
 	}
+	// Only a real change of the cells moves the generation: dirty marks
+	// that rebuild a chunk to the same cells (objects moved within it, or
+	// actors, which are not stamped) keep the users' caches valid.
+	changed = changed || cells_change;
 	if (changed) {
 		params.generation++;
 		params.origin_tx = volume.origin_tx;
@@ -1293,7 +1327,8 @@ void Shaded_grid::dump(int number) {
 		info << "avatar " << at.tx << "," << at.ty << "," << at.tz << " (local " << ax << "," << ay << ")\n";
 	}
 	info << "last build " << Fmt(last_build_ms) << " ms for " << last_built << " chunks, last recentre "
-		 << Fmt(last_recentre_ms) << " ms, chunks built in total " << chunks_built << "\n";
+		 << Fmt(last_recentre_ms) << " ms, chunks built in total " << chunks_built << " (" << chunks_unchanged
+		 << " to the same cells)\n";
 	info << "cells set " << count_set << ", clipped above lift " << (shaded_grid_lifts - 1) << ": " << clipped_cells << "\n";
 	static const std::pair<uint8_t, const char*> flag_names[]
 			= {{shaded_cell_solid, "solid"}, {shaded_cell_passes, "passes"}, {shaded_cell_roof, "roof"},

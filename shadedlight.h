@@ -868,6 +868,7 @@ private:
 	std::map<Shadow_key, Shadow_cache_entry>   map_cache;
 	std::vector<uint8_t>                       shadow_scratch;
 	long long                                  shadow_paints = 0;
+	int                                        field_generation = -1;    // Grid generation of field_cache.
 	std::string                                shadow_info;    // For the dump info.
 	// Headless debug hooks (EXULT_SHADED_HOUR, EXULT_SHADED_TELEPORT).
 	int  pending_hour     = -1;
