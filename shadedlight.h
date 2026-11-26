@@ -39,6 +39,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <iosfwd>
 #include <map>
 #include <memory>
@@ -457,6 +458,60 @@ constexpr float Shaded_cone_visibility(float sd, float cone, bool hard) {
 	return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
 }
 
+/*
+ *  The 3D box of a light's own object (world tiles, tiles, lifts), which
+ *  must not shadow its light in the grid.  valid = 0: none (carried).
+ */
+struct Shaded_light_box {
+	float   lo[3] = {0.0f, 0.0f, 0.0f};
+	float   hi[3] = {0.0f, 0.0f, 0.0f};
+	int32_t valid = 0;
+	int32_t pad   = 0;
+};
+
+/*
+ *  End of a grid ray from p towards t that stops just before the ray
+ *  enters box [lo, hi] (in p's frame): margin past the entry face, along
+ *  the entry axis.  t when the ray misses the box; p when p is inside.
+ */
+constexpr Shaded_point Shaded_clip_to_box(
+		const Shaded_point& p, const Shaded_point& t, const float lo[3], const float hi[3], float margin) {
+	const float a[3]   = {p.x, p.y, p.z};
+	const float d[3]   = {t.x - p.x, t.y - p.y, t.z - p.z};
+	float       enter  = 0.0f;
+	float       leave  = 1.0f;
+	int         axis   = -1;
+	for (int i = 0; i < 3; i++) {
+		if (d[i] == 0.0f) {
+			if (a[i] < lo[i] || a[i] > hi[i]) {
+				return t;
+			}
+			continue;
+		}
+		float t0 = (lo[i] - a[i]) / d[i];
+		float t1 = (hi[i] - a[i]) / d[i];
+		if (t0 > t1) {
+			const float s = t0;
+			t0            = t1;
+			t1            = s;
+		}
+		if (t0 > enter) {
+			enter = t0;
+			axis  = i;
+		}
+		leave = t1 < leave ? t1 : leave;
+	}
+	if (enter > leave) {
+		return t;    // Misses the box.
+	}
+	if (axis < 0) {
+		return p;    // Starts inside.
+	}
+	const float back = margin / (d[axis] < 0.0f ? -d[axis] : d[axis]);
+	const float s    = enter - back > 0.0f ? enter - back : 0.0f;
+	return Shaded_point{p.x + d[0] * s, p.y + d[1] * s, p.z + d[2] * s};
+}
+
 // Grid field values: transmittance * shaded_field_scale, or solid.
 constexpr uint8_t shaded_field_scale = 254;
 constexpr uint8_t shaded_field_solid = 255;
@@ -516,7 +571,9 @@ struct Shaded_shadow_set {
 	int32_t screen   = 1;    // Maps hold Ts.
 	int32_t ray_grid = 0;    // Maps also hold Tg, traced per cell.
 	float   strength = 1.0f;
-	// Per light: index into maps or fields, -1 for none (T = 1).
+	// Per light: its own object's box, and index into maps or fields, -1
+	// for none (T = 1).
+	std::vector<Shaded_light_box>    light_boxes;
 	std::vector<int32_t>             light_map;
 	std::vector<int32_t>             light_field;
 	std::vector<Shaded_shadow_map>   maps;
@@ -560,11 +617,17 @@ namespace Shaded_cpu {
 	void build_bins(
 			const Shaded_light_params& params, const std::vector<Shaded_light_record>& lights,
 			std::vector<uint32_t>& offsets, std::vector<uint16_t>& list);
+	// Grid transmittance from p to a light whose own object is box: the
+	// ray stops before that box, and is blocked if the cell it stops in is
+	// solid (the end cells are otherwise skipped).
+	float grid_transmittance(
+			const Shaded_grid_volume& vol, const Shaded_light_record& light, const Shaded_light_box& box,
+			const Shaded_point& p);
 	// Rows [y0, y1) of a grid field: the grid's transmittance from each
 	// cell centre to the light into data + field.offset.
 	void grid_field_rows(
 			const Shaded_grid_volume& vol, const Shaded_light_params& params, const Shaded_light_record& light,
-			const Shaded_shadow_field& field, int y0, int y1, uint8_t* data);
+			const Shaded_light_box& box, const Shaded_shadow_field& field, int y0, int y1, uint8_t* data);
 	// Cell rows [y0, y1) of the screen maps being built, over the cells
 	// rectangle: per cell the lights are ranked by unshadowed light and the
 	// top params.shadow_lights traced in screen space (others keep 1).
@@ -669,6 +732,10 @@ public:
 	// hooks and gathers the lights.  True if the paint must cover the
 	// whole game area.
 	bool prepare_paint();
+	// Right after prepare_paint: while shadows are on, a moving occluder
+	// shades beyond its own rectangle, so grow the paint rectangle (game
+	// pixels) by the screen rectangles of the lights it touches.
+	void widen_paint(int& x, int& y, int& w, int& h);
 	// Around Game_render::paint_map in Game_window::paint.
 	void begin_paint(Image_window8& win, bool full);
 	void end_paint(Image_window8& win, bool full);
@@ -755,12 +822,44 @@ private:
 	std::vector<std::vector<uint8_t>>  ref_pals;    // shaded_ref_palettes, 768 each.
 	std::string                        refs_game;    // Game the refs were read for.
 	uint64_t                           lit_hash    = 0;    // Light hash of the last lit paint.
-	float                              lit_sliders[4]{};    // Sliders of the last lit paint.
+	float                              lit_sliders[9]{};    // Sliders of the last lit paint.
+	int                                lit_grid    = -1;    // Grid generation of the last lit paint.
 	std::vector<unsigned char>         unlit_frame;    // Frame before the pass, for dumps.
 	long                               relit_pixels = 0;
 	long long                          widened_need   = 0;    // prepare_paint's full paints, by cause.
 	long long                          widened_lights = 0;
 	long long                          widened_scroll = 0;
+	long long                          widened_shadow = 0;    // widen_paint and grid changes.
+	// Traced shadows of the current paint, and their caches: grid fields
+	// and screen maps by everything they depend on.
+	struct Shadow_stats {
+		int    lights        = 0;    // With a map or field.
+		int    maps          = 0;
+		int    maps_reused   = 0;
+		long   cells         = 0;    // Of all maps.
+		long   traces        = 0;    // Screen traces run.
+		int    fields_built  = 0;
+		int    fields_reused = 0;
+		double field_us      = 0;
+		double screen_us     = 0;
+	};
+
+	struct Shadow_cache_entry {
+		Shaded_shadow_map    map;
+		Shaded_shadow_field  field;
+		std::vector<uint8_t> data;
+		long long            used = 0;    // shadow_paints when last used.
+	};
+
+	using Shadow_key = std::vector<int64_t>;
+	Shaded_shadow_set                          shadow_set;
+	bool                                       shadow_set_on = false;    // This paint's pass used it.
+	Shadow_stats                               shadow_stats;
+	std::map<Shadow_key, Shadow_cache_entry>   field_cache;
+	std::map<Shadow_key, Shadow_cache_entry>   map_cache;
+	std::vector<uint8_t>                       shadow_scratch;
+	long long                                  shadow_paints = 0;
+	std::string                                shadow_info;    // For the dump info.
 	// Headless debug hooks (EXULT_SHADED_HOUR, EXULT_SHADED_TELEPORT).
 	int  pending_hour     = -1;
 	bool pending_teleport = false;
@@ -786,6 +885,13 @@ private:
 	long long         full_light_passes = 0;
 	double            all_light_us    = 0;
 	double            full_light_us   = 0;
+	long long         shadow_passes   = 0;    // Shadow pass, all and full paints.
+	long long         full_shadow_passes = 0;
+	double            all_shadow_us   = 0;
+	double            full_shadow_us  = 0;
+	double            shadow_field_us = 0;    // Totals over all passes.
+	double            shadow_screen_us = 0;
+	long long         shadow_cache_hits = 0;
 	Clock::time_point last_report;
 	int               game_width      = 0;    // Of the last full paint.
 	int               game_height     = 0;
@@ -803,7 +909,12 @@ private:
 						  const Game_object& source, const Game_object& owner, const Shaded_light_entry& entry,
 						  Shaded_light_row row, bool carried);
 	void               shift(int dx, int dy);
-	int                light_pass(const Shaded_rect& r, uint8_t* levels, bool threaded, unsigned char* frame = nullptr);
+	int                light_pass(
+					   const Shaded_rect& r, uint8_t* levels, bool threaded, unsigned char* frame = nullptr,
+					   const Shaded_shadow_set* shadows = nullptr, uint8_t* shadow_out = nullptr);
+	void               run_bands(int bands, const std::function<void(int)>& job);
+	bool               shadow_pass(const Shaded_rect& r, Shaded_shadow_set& set, bool threaded, bool use_cache, Shadow_stats& stats);
+	void               check_shadows(const Shaded_rect& r);
 	bool               load_refs();
 	void               set_lit(bool on);
 	void           build_lut(uint8_t* lut) const;

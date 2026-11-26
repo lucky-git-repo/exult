@@ -343,6 +343,10 @@ void Game_window::paint(
 		w            = x1 - x;
 		h            = y1 - y;
 	}
+	if (main_actor) {
+		// Shadows reach past the rectangle of what moved.
+		Shaded_light::get().widen_paint(x, y, w, h);
+	}
 	// This will adjust and clip the rectangle as appropriate, it may end up
 	// bigger or smaller
 	win->BeginPaintIntoGuardBand(&x, &y, &w, &h);
