@@ -115,6 +115,8 @@ class Game_window {
 	bool painted;               // true if we updated image buffer.
 	bool ambient_light;         // Permanent version of special_light.
 	bool infravision_active;    // Infravision flag.
+	// Set by write_map(); write_gwin() then leaves the weather out.
+	bool saving_map = false;
 	// Game state values:
 	int           skip_above_actor;      // Level above actor to skip rendering.
 	unsigned int  in_dungeon;            // true if inside a dungeon.
@@ -837,11 +839,9 @@ public:
 	/*
 	 *  Save/restore/startup:
 	 */
-	// Write out to 'gamedat'. A map save (for initgame.dat) leaves out the
-	// weather, so new games don't start with it.
-	void write(bool nopaint = false, bool map_save = false);
+	void write(bool nopaint = false);      // Write out to 'gamedat'.
 	void read();                           // Read in 'gamedat'.
-	void write_gwin(bool map_save = false);    // Write gamedat/gamewin.dat.
+	void write_gwin();                     // Write gamedat/gamewin.dat.
 	void read_gwin();                      // Read gamedat/gamewin.dat.
 	bool was_map_modified();               // Was any map modified?
 	void write_map();                      // Write map data to <PATCH> dir.

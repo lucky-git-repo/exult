@@ -90,6 +90,7 @@
 #include <cstring>
 #include <memory>
 #include <sstream>
+#include <utility>
 
 #ifdef USE_EXULTSTUDIO
 #	include "servemsg.h"
@@ -1417,7 +1418,7 @@ bool Game_window::init_gamedat(bool create) {
  *  Output: 0 if error, already reported.
  */
 
-void Game_window::write(bool nopaint, bool map_save) {
+void Game_window::write(bool nopaint) {
 	// Lets just show a nice message on screen first
 
 	const int width       = get_width();
@@ -1440,7 +1441,7 @@ void Game_window::write(bool nopaint, bool map_save) {
 	write_npcs();              // Write out npc.dat.
 	usecode->write();          // Usecode.dat (party, global flags).
 	Notebook_gump::write();    // Write out journal.
-	write_gwin(map_save);      // Write our data.
+	write_gwin();              // Write our data.
 	write_saveinfo(!nopaint);
 }
 
@@ -1476,7 +1477,7 @@ void Game_window::read() {
  *  Output: 0 if error.
  */
 
-void Game_window::write_gwin(bool map_save) {
+void Game_window::write_gwin() {
 	OFileDataSource gout(GWINDAT);
 	// Start with scroll coords (in tiles).
 	gout.write2(get_scrolltx());
@@ -1498,8 +1499,9 @@ void Game_window::write_gwin(bool map_save) {
 	gout.write1(ambient_light ? 1 : 0);
 	gout.write1(combat ? 1 : 0);
 	gout.write1(infravision_active ? 1 : 0);
-	if (map_save) {
-		gout.write1(0);    // No weather in initgame.dat.
+	// A map save goes to initgame.dat, and new games would start with it.
+	if (std::exchange(saving_map, false)) {
+		gout.write1(0);    // No weather.
 	} else {
 		effects->write_weather(gout);
 	}
@@ -1608,12 +1610,13 @@ bool Game_window::was_map_modified() {
  */
 
 void Game_window::write_map() {
+	saving_map = true;    // No weather in initgame.dat (write_gwin).
 	for (auto* map : maps) {
 		if (map && map->was_map_modified()) {
 			map->write_static();    // Write ifix, map files.
 		}
 	}
-	write(false, true);    // Write out to 'gamedat' too.
+	write();    // Write out to 'gamedat' too.
 	save_gamedat(PATCH_INITGAME, "Saved map");
 }
 
