@@ -32,6 +32,7 @@
 #include "data_utils.h"
 #include "exceptions.h"
 #include "exult.h"
+#include "fnames.h"
 #include "game.h"
 #include "gameclk.h"
 #include "gamemap.h"
@@ -54,6 +55,8 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <iterator>
+#include <limits>
 #include <mutex>
 #include <sstream>
 #include <thread>
@@ -100,6 +103,11 @@ static_assert(!Shaded_faces_light(shaded_face_east, -2.0f, 0.0f, 0.0f));
 static_assert(Shaded_faces_light(shaded_face_top, 1.0f, 1.0f, 0.5f));
 static_assert(!Shaded_faces_light(shaded_face_top, 1.0f, 1.0f, -0.5f));
 static_assert(!Shaded_faces_light(shaded_face_ground | shaded_face_clamped, 0.0f, 0.0f, -1.0f));
+// Luminance weights sum to 1: white is 63 * 1000.
+static_assert(Shaded_luminance(63, 63, 63) == 63000 && Shaded_luminance(0, 0, 0) == 0);
+static_assert(Shaded_luminance(0, 63, 0) > Shaded_luminance(63, 0, 0) && Shaded_luminance(63, 0, 0) > Shaded_luminance(0, 0, 63));
+// The cycling colours are left alone.
+static_assert(shaded_last_lit_index == 0xdf && shaded_remap_size == 32 * 256);
 
 /*
  *  A small persistent thread pool for the light pass.  run() hands bands
@@ -375,6 +383,12 @@ namespace {
 			hash *= 1099511628211ull;
 			v >>= 8;
 		}
+	}
+
+	// The game and mod, to notice when data must be read again.
+	std::string Game_key() {
+		return std::to_string(static_cast<int>(Game::get_game_type())) + "/" + Game::get_gametitle() + "/"
+			   + Game::get_modtitle();
 	}
 
 	const char* Row_name(Shaded_light_row row) {
@@ -665,6 +679,108 @@ void Shaded_cpu::light_rows(
 	}
 }
 
+void Shaded_cpu::apply_light_rows(
+		const Shaded_scene_buffers& buf, const Shaded_rect& r, int y0, int y1, const uint8_t* levels, const uint8_t* remap,
+		unsigned char* frame) {
+	for (int y = y0; y < y1; y++) {
+		const int idx = buf.index(r.x, y);
+		for (int i = idx; i < idx + r.w; i++) {
+			frame[i] = remap[levels[i] * 256 + frame[i]];
+		}
+	}
+}
+
+float Shaded_cpu::palette_luminance(const uint8_t* pal768, const uint8_t* day768) {
+	long sum = 0, day = 0;
+	for (int i = 1; i <= shaded_last_lit_index; i++) {
+		sum += Shaded_luminance(pal768[3 * i], pal768[3 * i + 1], pal768[3 * i + 2]);
+		day += Shaded_luminance(day768[3 * i], day768[3 * i + 1], day768[3 * i + 2]);
+	}
+	return day > 0 ? static_cast<float>(sum) / static_cast<float>(day) : 0.0f;
+}
+
+int Shaded_cpu::nearest_colour(const uint8_t* pal768, int r, int g, int b, int first, int last) {
+	int best      = first;
+	int best_dist = std::numeric_limits<int>::max();
+	for (int i = first; i <= last; i++) {
+		const int dr   = r - pal768[3 * i];
+		const int dg   = g - pal768[3 * i + 1];
+		const int db   = b - pal768[3 * i + 2];
+		const int dist = dr * dr + dg * dg + db * db;
+		if (dist < best_dist) {
+			best      = i;
+			best_dist = dist;
+			if (dist == 0) {
+				break;
+			}
+		}
+	}
+	return best;
+}
+
+void Shaded_cpu::build_remap(
+		const uint8_t* ambient768, const uint8_t* const refs[4], Shaded_light_params& params, uint8_t* remap,
+		uint8_t* displayed768, Shaded_ramp* ramp) {
+	const uint8_t* day = refs[0];
+	// The stops: black, A at its (slider scaled) luminance, then the brighter
+	// reference palettes by luminance, DAY last at 1.
+	const float    ambient = std::clamp(palette_luminance(ambient768, day) * params.ambient, 0.0f, 1.0f);
+	Shaded_ramp    stops;
+	const uint8_t* colours[6];
+	auto           add_stop = [&](int palette, float level, const uint8_t* pal) {
+        stops.palette[stops.count] = palette;
+        stops.level[stops.count]   = level;
+        colours[stops.count]       = pal;
+        stops.count++;
+	};
+	add_stop(Shaded_ramp::black, 0.0f, nullptr);
+	add_stop(Shaded_ramp::ambient, ambient, ambient768);
+	std::pair<float, int> brighter[3];
+	int                   nbrighter = 0;
+	for (int k = 1; k < 4; k++) {
+		const float y = palette_luminance(refs[k], day);
+		if (y > ambient + 0.02f && y < 0.98f) {
+			brighter[nbrighter++] = std::make_pair(y, k);
+		}
+	}
+	std::sort(brighter, brighter + nbrighter);
+	for (int k = 0; k < nbrighter; k++) {
+		add_stop(shaded_ref_palettes[brighter[k].second], brighter[k].first, refs[brighter[k].second]);
+	}
+	add_stop(shaded_ref_palettes[0], 1.0f, day);
+	const int top = std::max(params.level_count - 1, 1);
+	for (int q = 0; q < shaded_light_levels; q++) {
+		const float l   = std::min(static_cast<float>(q) / static_cast<float>(top), 1.0f);
+		int         seg = 0;    // Stops seg and seg + 1 bracket l.
+		while (seg + 2 < stops.count && l > stops.level[seg + 1]) {
+			seg++;
+		}
+		const float span = stops.level[seg + 1] - stops.level[seg];
+		const float t    = span > 1e-6f ? std::clamp((l - stops.level[seg]) / span, 0.0f, 1.0f) : 1.0f;
+		uint8_t*    row  = remap + q * 256;
+		for (int i = 0; i < 256; i++) {
+			row[i] = static_cast<uint8_t>(i);
+		}
+		for (int i = 1; i <= shaded_last_lit_index; i++) {
+			int c[3];
+			for (int k = 0; k < 3; k++) {
+				const float lo = colours[seg] ? colours[seg][3 * i + k] : 0.0f;
+				const float hi = colours[seg + 1] ? colours[seg + 1][3 * i + k] : 0.0f;
+				c[k]           = static_cast<int>(std::lround(lo + (hi - lo) * t));
+			}
+			row[i] = static_cast<uint8_t>(nearest_colour(day, c[0], c[1], c[2], 1, shaded_last_lit_index));
+		}
+	}
+	// B': DAY for the relit indices, A's own cycling colours, DAY's 0xff.
+	std::memcpy(displayed768, day, 768);
+	std::memcpy(displayed768 + 3 * (shaded_last_lit_index + 1), ambient768 + 3 * (shaded_last_lit_index + 1),
+				3 * (0xff - shaded_last_lit_index - 1));
+	params.ambient_level = ambient;
+	if (ramp) {
+		*ramp = stops;
+	}
+}
+
 void Shaded_cpu::resolve_view(
 		const Shaded_scene_buffers& buf, const Shaded_light_params& params, const Shaded_rect& r, const uint8_t* lut,
 		unsigned char* frame) {
@@ -692,7 +808,6 @@ Shaded_light& Shaded_light::get() {
 
 Shaded_light::Shaded_light() {
 	read_config();
-	bool enabled = lighting_on;
 	if (const char* hour = std::getenv("EXULT_SHADED_HOUR"); hour && *hour) {
 		pending_hour = std::clamp(std::atoi(hour), 0, 23);
 	}
@@ -710,10 +825,14 @@ Shaded_light::Shaded_light() {
 			std::cout << "SHADED: could not create dump folder " << dump_dir << ": " << ec.message() << std::endl;
 			dump_dir.clear();
 		} else {
-			enabled     = true;
-			lighting_on = true;
+			lighting_on = true;    // Unless EXULT_SHADED_LIGHT=0.
 		}
 	}
+	// EXULT_SHADED_LIGHT=0|1 overrides the option, for comparison runs.
+	if (const char* light = std::getenv("EXULT_SHADED_LIGHT"); light && *light) {
+		lighting_on = *light != '0';
+	}
+	const bool enabled = lighting_on || !dump_dir.empty();
 	const char* at = std::getenv("EXULT_SHADED_DUMP_AT");
 	std::stringstream times(at && *at ? at : "6000");
 	std::string       item;
@@ -859,7 +978,7 @@ void Shaded_light::run_debug_hooks() {
 
 void Shaded_light::load_table() {
 	const Exult_Game  game = Game::get_game_type();
-	const std::string key  = std::to_string(static_cast<int>(game)) + "/" + Game::get_gametitle() + "/" + Game::get_modtitle();
+	const std::string key  = Game_key();
 	if (table_loaded && key == table_game) {
 		return;
 	}
@@ -1068,8 +1187,146 @@ bool Shaded_light::prepare_paint() {
 	run_debug_hooks();
 	load_table();
 	gather_lights();
-	// Nothing is lit from the lights yet, so no paint needs widening.
-	return false;
+	Game_window* gwin = Game_window::get_instance();
+	// A game loaded at night set its palette before there was a main actor,
+	// so apply it once more to let lighting take over.
+	Palette* pal = gwin->get_pal();
+	if (lighting_on && !seen_world_palette && !applied_palette && pal && !pal->is_faded_out()) {
+		applied_palette = true;
+		pal->apply(false);
+	}
+	// The lighting of a partial paint must match the frame around it, so
+	// any change of what it depends on paints the whole game area.
+	const float sliders[4] = {params.ambient, params.brightness, params.radius_scale, params.softness};
+	const bool  lights_changed
+			= lit_active && (light_hash != lit_hash || !std::equal(sliders, sliders + 4, lit_sliders));
+	// A record made at a smooth-scroll pixel offset cannot be shifted by
+	// whole tiles.
+	const bool scrolled = (gwin->get_scrolltx() != params.scroll_tx || gwin->get_scrollty() != params.scroll_ty)
+						  && (params.scroll_px != 0 || params.scroll_py != 0 || gwin->is_lerping_enabled());
+	widened_need += need_full ? 1 : 0;
+	widened_lights += lights_changed ? 1 : 0;
+	widened_scroll += scrolled ? 1 : 0;
+	return need_full || lights_changed || scrolled;
+}
+
+bool Shaded_light::lightable_palette(int n) {
+	return n == PALETTE_DUSK || n == PALETTE_NIGHT || n == PALETTE_SPELL;
+}
+
+/*
+ *  Turn lighting on or off; either way every pixel must be painted again.
+ */
+
+void Shaded_light::set_lit(bool on) {
+	if (on == lit_active) {
+		return;
+	}
+	lit_active = on;
+	need_full  = true;
+	Game_window::get_instance()->set_all_dirty();
+}
+
+/*
+ *  Read the reference palettes of the ramp (raw 6-bit colours) when the
+ *  game or mod has changed.  False if palettes.flx is not there yet.
+ */
+
+bool Shaded_light::load_refs() {
+	const std::string key = Game_key();
+	if (ref_pals.size() == std::size(shaded_ref_palettes) && key == refs_game) {
+		return true;
+	}
+	ref_pals.clear();
+	refs_game.clear();
+	try {
+		for (const int n : shaded_ref_palettes) {
+			Palette tmp;
+			tmp.load(PALETTES_FLX, PATCH_PALETTES, n);
+			std::vector<uint8_t> colours(768);
+			for (int i = 0; i < 256; i++) {
+				colours[3 * i]     = tmp.get_red(i);
+				colours[3 * i + 1] = tmp.get_green(i);
+				colours[3 * i + 2] = tmp.get_blue(i);
+			}
+			ref_pals.push_back(std::move(colours));
+		}
+	} catch (...) {
+		ref_pals.clear();
+		return false;
+	}
+	// An unreadable palette loads as black; without DAY there is no ramp.
+	const uint8_t* day = ref_pals[0].data();
+	if (std::all_of(day + 3, day + 3 * (shaded_last_lit_index + 1), [](uint8_t c) {
+			return c == 0;
+		})) {
+		ref_pals.clear();
+		return false;
+	}
+	refs_game = key;
+	return true;
+}
+
+/*
+ *  The palette state machine: lighting takes over from the whole-screen
+ *  light palettes while the clock shows a lightable palette (or a
+ *  transition into or out of one) that is darker than day.
+ */
+
+bool Shaded_light::filter_palette(
+		const unsigned char* in768, int palnum, bool world, bool transition, unsigned char* out768) {
+	if (!lighting_on) {
+		return false;
+	}
+	Game_window* gwin = Game_window::get_instance();
+	if (!gwin->get_main_actor() || gwin->is_in_exult_menu()) {
+		set_lit(false);
+		return false;
+	}
+	if (world || transition) {
+		seen_world_palette = true;
+	}
+	// Hit and lightning flashes show as they are over the lit frame.
+	if (world && (palnum == PALETTE_RED || palnum == PALETTE_LIGHTNING)) {
+		return false;
+	}
+	// Day, fog, overcast, invisibility and custom palettes stay as they are.
+	if (!((world && lightable_palette(palnum)) || transition)) {
+		set_lit(false);
+		return false;
+	}
+	clock_palette         = world ? palnum : -1;
+	const std::string key = Game_key();
+	const bool        same_ambient
+			= have_ambient && ambient_pal.size() == 768 && std::equal(in768, in768 + 768, ambient_pal.begin());
+	if (!same_ambient || remap_slider != params.ambient || remap_game != key) {
+		if (!load_refs()) {
+			set_lit(false);
+			return false;
+		}
+		ambient_pal.assign(in768, in768 + 768);
+		have_ambient = true;
+		remap.resize(shaded_remap_size);
+		displayed_pal.resize(768);
+		const uint8_t* refs[4] = {ref_pals[0].data(), ref_pals[1].data(), ref_pals[2].data(), ref_pals[3].data()};
+		Shaded_cpu::build_remap(ambient_pal.data(), refs, params, remap.data(), displayed_pal.data(), &ramp);
+		ambient_y    = Shaded_cpu::palette_luminance(ambient_pal.data(), refs[0]);
+		remap_slider = params.ambient;
+		remap_game   = key;
+		if (lit_active) {    // The lit frame no longer matches.
+			need_full = true;
+			gwin->set_all_dirty();
+		}
+	}
+	if (params.ambient_level >= 0.999f) {
+		set_lit(false);
+		return false;
+	}
+	set_lit(true);
+	std::memcpy(out768, displayed_pal.data(), 768);
+	// The border entry is handled as without lighting.
+	std::memcpy(out768 + 3 * 0xff, in768 + 3 * 0xff, 3);
+	return true;
 }
 
 /*
@@ -1103,6 +1360,7 @@ bool Shaded_light::setup_buffers(Image_window8& win) {
 		buffers.objects.clear();
 		object_index.clear();
 		main_actor_id         = shaded_id_none;
+		need_full             = true;    // Nothing recorded outside this clip.
 		params.buffer_width   = buffers.width;
 		params.buffer_height  = buffers.height;
 		params.buffer_stride  = buffers.stride;
@@ -1132,6 +1390,7 @@ void Shaded_light::begin_paint(Image_window8& win, bool full) {
 		buffers.objects.clear();
 		object_index.clear();
 		main_actor_id = shaded_id_none;
+		need_full     = false;
 	} else if (gwin->get_scrolltx() != params.scroll_tx || gwin->get_scrollty() != params.scroll_ty) {
 		// Scrolling copies the frame and paints only the new strip, so move
 		// the record the same way.
@@ -1257,10 +1516,11 @@ void Shaded_light::end_paint(Image_window8& win, bool full) {
 
 /*
  *  Light the rows of r into levels, in bands on the workers if threaded
- *  and r is big enough.  Returns the number of bands.
+ *  and r is big enough, then relight frame's pixels if it is not null.
+ *  Returns the number of bands.
  */
 
-int Shaded_light::light_pass(const Shaded_rect& r, uint8_t* levels, bool threaded) {
+int Shaded_light::light_pass(const Shaded_rect& r, uint8_t* levels, bool threaded, unsigned char* frame) {
 	if (r.w <= 0 || r.h <= 0) {
 		return 0;
 	}
@@ -1269,6 +1529,9 @@ int Shaded_light::light_pass(const Shaded_rect& r, uint8_t* levels, bool threade
 		const int y1 = r.y + r.h * (b + 1) / bands;
 		Shaded_cpu::light_rows(
 				buffers, params, lights.data(), buffers.bin_offsets.data(), buffers.bin_lights.data(), r, y0, y1, levels);
+		if (frame) {
+			Shaded_cpu::apply_light_rows(buffers, r, y0, y1, levels, remap.data(), frame);
+		}
 	};
 	const int bands = threaded && params.threads > 1 && r.w * r.h >= 4096 ? std::min(params.threads, r.h) : 1;
 	if (bands <= 1) {
@@ -1290,34 +1553,6 @@ void Shaded_light::finish_paint(Image_window8& win, bool full) {
 	}
 	finish_due                    = false;
 	const Clock::time_point start = Clock::now();
-	// The lights' own objects, as recorded in this frame (0 = not painted).
-	for (size_t i = 0; i < lights.size(); i++) {
-		const auto it         = object_index.find(light_objects[i]);
-		const int  id         = it != object_index.end() ? it->second : shaded_id_none;
-		lights[i].object_id   = id == shaded_id_overflow ? shaded_id_none : id;
-	}
-	Game_window* gwin  = Game_window::get_instance();
-	params.light_count = static_cast<int32_t>(lights.size());
-	params.bins_x      = (gwin->get_width() + params.bin_size - 1) / params.bin_size;
-	params.bins_y      = (gwin->get_height() + params.bin_size - 1) / params.bin_size;
-	int bands          = 0;
-	switch (backend()) {
-	case Shaded_backend::gpu:    // backend() falls back to CPU.
-	case Shaded_backend::cpu:
-		Shaded_cpu::build_bins(params, lights, buffers.bin_offsets, buffers.bin_lights);
-		bands = light_pass(clip, buffers.light_levels.data(), true);
-		break;
-	}
-	const Clock::time_point stop = Clock::now();
-	if (timing) {
-		const double us = std::chrono::duration<double, std::micro>(stop - start).count();
-		light_passes++;
-		all_light_us += us;
-		if (full) {
-			full_light_passes++;
-			full_light_us += us;
-		}
-	}
 	// Due a dump?  Wanted on a full paint; full paints can be rare (the
 	// game repaints only dirty areas), so after a second's wait a partial
 	// paint does: the record outside its clip is still that of the frame.
@@ -1325,11 +1560,59 @@ void Shaded_light::finish_paint(Image_window8& win, bool full) {
 	if (!dump_dir.empty()) {
 		if (!clock_started && full) {
 			clock_started = true;
-			first_paint   = stop;
+			first_paint   = start;
 		}
 		if (clock_started && dump_next < dump_at.size()) {
-			const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(stop - first_paint).count();
+			const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(start - first_paint).count();
 			due           = ms >= dump_at[dump_next] && (full || ms >= dump_at[dump_next] + 1000);
+		}
+	}
+	// The pass runs while lighting is active, for the light views and for
+	// dumps; it relights the frame only while active and not viewing unlit.
+	const auto view  = static_cast<Shaded_view>(params.view);
+	const bool apply = lit_active && view != Shaded_view::unlit && remap.size() == shaded_remap_size;
+	const bool pass  = lit_active || view == Shaded_view::light || view == Shaded_view::unlit || due;
+	auto*      frame = static_cast<unsigned char*>(win.get_draw_surface()->pixels);
+	params.lit       = apply ? 1 : 0;
+	relit_pixels     = 0;
+	unlit_frame.clear();
+	if (due && apply) {
+		unlit_frame.assign(frame, frame + buffers.height_map.size());
+	}
+	int bands = 0;
+	if (pass) {
+		// The lights' own objects, as recorded in this frame (0 = not painted).
+		for (size_t i = 0; i < lights.size(); i++) {
+			const auto it       = object_index.find(light_objects[i]);
+			const int  id       = it != object_index.end() ? it->second : shaded_id_none;
+			lights[i].object_id = id == shaded_id_overflow ? shaded_id_none : id;
+		}
+		Game_window* gwin  = Game_window::get_instance();
+		params.light_count = static_cast<int32_t>(lights.size());
+		params.bins_x      = (gwin->get_width() + params.bin_size - 1) / params.bin_size;
+		params.bins_y      = (gwin->get_height() + params.bin_size - 1) / params.bin_size;
+		switch (backend()) {
+		case Shaded_backend::gpu:    // backend() falls back to CPU.
+		case Shaded_backend::cpu:
+			Shaded_cpu::build_bins(params, lights, buffers.bin_offsets, buffers.bin_lights);
+			bands = light_pass(clip, buffers.light_levels.data(), true, apply ? frame : nullptr);
+			break;
+		}
+		if (apply) {
+			lit_hash       = light_hash;
+			lit_sliders[0] = params.ambient;
+			lit_sliders[1] = params.brightness;
+			lit_sliders[2] = params.radius_scale;
+			lit_sliders[3] = params.softness;
+		}
+		if (timing) {
+			const double us = std::chrono::duration<double, std::micro>(Clock::now() - start).count();
+			light_passes++;
+			all_light_us += us;
+			if (full) {
+				full_light_passes++;
+				full_light_us += us;
+			}
 		}
 	}
 	if (due) {
@@ -1349,14 +1632,20 @@ void Shaded_light::finish_paint(Image_window8& win, bool full) {
 			thread_check = "check threads not compared (" + std::to_string(params.threads) + " threads, "
 						   + std::to_string(bands) + " band)";
 		}
+		if (!unlit_frame.empty()) {
+			for (int y = clip.y; y < clip.y + clip.h; y++) {
+				const int idx = buffers.index(clip.x, y);
+				for (int i = idx; i < idx + clip.w; i++) {
+					relit_pixels += unlit_frame[i] != frame[i] ? 1 : 0;
+				}
+			}
+		}
 		dump(win, static_cast<int>(dump_next), false, full);
 		thread_check.clear();
 	}
-	const auto view = static_cast<Shaded_view>(params.view);
 	if (view != Shaded_view::normal && view != Shaded_view::unlit) {
 		uint8_t lut[lut_size];
 		build_lut(lut);
-		auto* frame = static_cast<unsigned char*>(win.get_draw_surface()->pixels);
 		switch (backend()) {
 		case Shaded_backend::gpu:    // backend() falls back to CPU.
 		case Shaded_backend::cpu:
@@ -1369,6 +1658,7 @@ void Shaded_light::finish_paint(Image_window8& win, bool full) {
 	}
 	if (due) {
 		dump_next++;
+		unlit_frame.clear();
 		if (timing) {
 			report_timing();
 		}
@@ -1503,7 +1793,11 @@ void Shaded_light::build_lut(uint8_t* lut) const {
 		case Shaded_view::count:
 			break;
 		}
-		const int index = pal->find_color(col.r * scale / 255, col.g * scale / 255, col.b * scale / 255);
+		const int r = col.r * scale / 255, g = col.g * scale / 255, b = col.b * scale / 255;
+		// While lit, the screen shows the displayed palette, not pal's.
+		const int index = lit_active && displayed_pal.size() == 768
+								  ? Shaded_cpu::nearest_colour(displayed_pal.data(), r, g, b, 0, shaded_last_lit_index)
+								  : pal->find_color(r, g, b);
 		lut[code]       = static_cast<uint8_t>(std::max(index, 0));
 	}
 }
@@ -1540,8 +1834,14 @@ void Shaded_light::dump(Image_window8& win, int number, bool view, bool full) {
 		ignore_unused_variable_warning(name);
 #endif
 	};
-	auto frame_colour = [&](int idx) {
+	// The frame through the palette on screen: B' while lit, else pal's.
+	const bool shown_lit    = lit_active && displayed_pal.size() == 768;
+	auto       frame_colour = [&](int idx) {
 		const int pix = frame[idx];
+		if (shown_lit) {
+			return Rgb{displayed_pal[3 * pix] * 255 / maxval, displayed_pal[3 * pix + 1] * 255 / maxval,
+					   displayed_pal[3 * pix + 2] * 255 / maxval};
+		}
 		return Rgb{pal->get_red(pix) * 255 / maxval, pal->get_green(pix) * 255 / maxval, pal->get_blue(pix) * 255 / maxval};
 	};
 #ifndef HAVE_PNG_H
@@ -1556,6 +1856,14 @@ void Shaded_light::dump(Image_window8& win, int number, bool view, bool full) {
 		return;
 	}
 	image("normal", frame_colour);
+	if (!unlit_frame.empty() && ambient_pal.size() == 768) {
+		// The frame before the pass, through the ambient palette.
+		image("unlit", [&](int idx) {
+			const int pix = unlit_frame[idx];
+			return Rgb{ambient_pal[3 * pix] * 255 / maxval, ambient_pal[3 * pix + 1] * 255 / maxval,
+					   ambient_pal[3 * pix + 2] * 255 / maxval};
+		});
+	}
 	image("height", [&](int idx) {
 		if ((buffers.facing_map[idx] & shaded_face_mask) == shaded_face_none) {
 			return Rgb{0, 0, 0};
@@ -1694,6 +2002,7 @@ void Shaded_light::dump(Image_window8& win, int number, bool view, bool full) {
 	if (!thread_check.empty()) {
 		info << thread_check << "\n";
 	}
+	write_lighting_info(info);
 	info << "lights " << lights.size() << " hash " << std::hex << light_hash << std::dec << "\n";
 	for (size_t i = 0; i < lights.size(); i++) {
 		const Shaded_light_record& rec = lights[i];
@@ -1712,6 +2021,95 @@ void Shaded_light::dump(Image_window8& win, int number, bool view, bool full) {
 #endif
 }
 
+/*
+ *  Lighting state and the remap self-checks, for the dump info file.
+ */
+
+void Shaded_light::write_lighting_info(std::ostream& info) {
+	const Palette* pal = Game_window::get_instance()->get_pal();
+	info << "lighting " << (lit_active ? "active" : "inactive") << " (option " << (lighting_on ? "on" : "off")
+		 << ", relit " << params.lit << ")\n"
+		 << "clock palette " << clock_palette << " window palette " << pal->get_palette_index() << "\n"
+		 << "ambient Y " << ambient_y << " slider " << params.ambient << " effective " << params.ambient_level << "\n"
+		 << "ramp stops";
+	if (ramp.count == 0) {
+		info << " none";
+	}
+	for (int k = 0; k < ramp.count; k++) {
+		info << " ";
+		if (ramp.palette[k] == Shaded_ramp::black) {
+			info << "black";
+		} else if (ramp.palette[k] == Shaded_ramp::ambient) {
+			info << "ambient";
+		} else {
+			info << "palette" << ramp.palette[k];
+		}
+		info << "=" << ramp.level[k];
+	}
+	info << "\n"
+		 << "pixels relit " << relit_pixels << "\n";
+	if (!load_refs()) {
+		info << "check remap not built (no palettes)\n";
+		return;
+	}
+	const uint8_t* refs[4] = {ref_pals[0].data(), ref_pals[1].data(), ref_pals[2].data(), ref_pals[3].data()};
+	const uint8_t* day     = refs[0];
+	// Luminance of every palettes.flx palette, relative to DAY.
+	info << "palette Y";
+	for (int n = 0; n <= PALETTE_MANY_LIGHTS; n++) {
+		info << " " << n << "=";
+		try {
+			Palette tmp;
+			tmp.load(PALETTES_FLX, PATCH_PALETTES, n);
+			uint8_t colours[768];
+			for (int i = 0; i < 256; i++) {
+				colours[3 * i]     = tmp.get_red(i);
+				colours[3 * i + 1] = tmp.get_green(i);
+				colours[3 * i + 2] = tmp.get_blue(i);
+			}
+			info << Shaded_cpu::palette_luminance(colours, day);
+		} catch (...) {
+			info << "?";
+		}
+	}
+	info << "\n";
+	// Built for a DAY ambient, full light must give every index back, unless
+	// DAY has the same colour twice.
+	const int            top = std::max(params.level_count - 1, 1);
+	std::vector<uint8_t> scratch(shaded_remap_size);
+	std::vector<uint8_t> shown(768);
+	Shaded_light_params  day_params = params;
+	day_params.ambient              = 1.0f;
+	Shaded_cpu::build_remap(day, refs, day_params, scratch.data(), shown.data(), nullptr);
+	int same = 0;
+	for (int i = 1; i <= shaded_last_lit_index; i++) {
+		same += scratch[top * 256 + i] == i ? 1 : 0;
+	}
+	info << "check remap day-identity " << same << " of " << shaded_last_lit_index << "\n";
+	// Indices whose relit colour gets darker anywhere as the level rises.
+	if (remap.size() != shaded_remap_size) {
+		info << "check monotonic not built\n";
+		return;
+	}
+	// Also counted beyond 2/63 of white, past the nearest colour's jitter.
+	constexpr int jitter  = Shaded_luminance(2, 2, 2);
+	int           falling = 0, falling_far = 0;
+	auto          lum     = [day](int index) {
+		return Shaded_luminance(day[3 * index], day[3 * index + 1], day[3 * index + 2]);
+	};
+	for (int i = 1; i <= shaded_last_lit_index; i++) {
+		bool fell = false, fell_far = false;
+		for (int q = 1; q <= top; q++) {
+			const int drop = lum(remap[(q - 1) * 256 + i]) - lum(remap[q * 256 + i]);
+			fell           = fell || drop > 0;
+			fell_far       = fell_far || drop > jitter;
+		}
+		falling += fell ? 1 : 0;
+		falling_far += fell_far ? 1 : 0;
+	}
+	info << "check monotonic " << falling << " (" << falling_far << " by more than 2/63)\n";
+}
+
 void Shaded_light::report_timing() const {
 	const double n  = full_paints > 0 ? static_cast<double>(full_paints) : 1.0;
 	const double np = paints > 0 ? static_cast<double>(paints) : 1.0;
@@ -1722,5 +2120,6 @@ void Shaded_light::report_timing() const {
 			  << " light_avg_us=" << full_light_us / static_cast<double>(std::max(full_light_passes, 1LL))
 			  << " all_light_avg_us=" << all_light_us / static_cast<double>(std::max(light_passes, 1LL))
 			  << " light_passes=" << light_passes << " threads=" << params.threads << " lights=" << params.light_count
-			  << std::endl;
+			  << " lit=" << (lit_active ? 1 : 0) << " widened_need=" << widened_need << " widened_lights=" << widened_lights
+			  << " widened_scroll=" << widened_scroll << std::endl;
 }

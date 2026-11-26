@@ -39,6 +39,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <iosfwd>
 #include <map>
 #include <memory>
 #include <string>
@@ -320,6 +321,32 @@ constexpr bool Shaded_faces_light(uint8_t facing, float dx, float dy, float dz) 
 }
 
 /*
+ *  Colour ramp of the remap tables: the palettes it passes through, each at
+ *  its light level (0 = black, 1 = DAY).
+ */
+struct Shaded_ramp {
+	static constexpr int black   = -1;    // Palette code of the black stop.
+	static constexpr int ambient = -2;    // Palette code of the ambient stop.
+	int                  count   = 0;
+	int                  palette[6]{};    // palettes.flx number, black or ambient.
+	float                level[6]{};
+};
+
+// Remap tables: shaded_light_levels rows of 256 palette indices.
+constexpr int shaded_remap_size = shaded_light_levels * 256;
+// Last palette index the remap relights; 0xe0 on are the cycling colours.
+constexpr int shaded_last_lit_index = 0xdf;
+// Reference palettes of the ramp, in Shaded_cpu::build_remap's refs order.
+constexpr int shaded_ref_palettes[4] = {0, 7, 11, 12};    // DAY, CANDLE, SINGLE_LIGHT, MANY_LIGHTS.
+
+/*
+ *  Relative luminance of a 6-bit colour, times 1000.
+ */
+constexpr int Shaded_luminance(int r, int g, int b) {
+	return 299 * r + 587 * g + 114 * b;
+}
+
+/*
  *  What the per-pixel steps need to know about the object being painted.
  */
 struct Shaded_object_context {
@@ -362,6 +389,22 @@ namespace Shaded_cpu {
 			const Shaded_scene_buffers& buf, const Shaded_light_params& params, const Shaded_light_record* lights,
 			const uint32_t* bin_offsets, const uint16_t* bin_lights, const Shaded_rect& r, int y0, int y1,
 			uint8_t* levels);
+	// Relight rows [y0, y1) of r of an 8-bit frame (indexed like the
+	// buffers): frame[i] = remap[levels[i] * 256 + frame[i]].
+	void apply_light_rows(
+			const Shaded_scene_buffers& buf, const Shaded_rect& r, int y0, int y1, const uint8_t* levels,
+			const uint8_t* remap, unsigned char* frame);
+	// Mean luminance of indices 1..0xdf of a 6-bit palette, relative to day.
+	float palette_luminance(const uint8_t* pal768, const uint8_t* day768);
+	// Index in [first, last] of the colour of pal768 nearest (r, g, b).
+	int nearest_colour(const uint8_t* pal768, int r, int g, int b, int first, int last);
+	// Remap tables (shaded_remap_size bytes) from the ambient palette and the
+	// reference palettes (DAY, CANDLE, SINGLE_LIGHT, MANY_LIGHTS), and the
+	// palette to display with them.  Sets params.ambient_level; the stops
+	// go into ramp if it is not null.
+	void build_remap(
+			const uint8_t* ambient768, const uint8_t* const refs[4], Shaded_light_params& params, uint8_t* remap,
+			uint8_t* displayed768, Shaded_ramp* ramp);
 }    // namespace Shaded_cpu
 
 class Shaded_workers;
@@ -386,10 +429,25 @@ public:
 		return record_on;
 	}
 
-	// The shaded light option (config, or a dump run) is on.
+	// The shaded light option (config, EXULT_SHADED_LIGHT, or a dump run) is
+	// on.  The clock then picks palettes with lamps ignored.
 	bool lighting_enabled() const {
 		return lighting_on;
 	}
+
+	// Lighting relights the world this paint (night palettes).
+	bool lighting_active() const {
+		return lit_active;
+	}
+
+	// Palettes lighting works over: DUSK/DAWN, NIGHT and SPELL.
+	static bool lightable_palette(int n);
+	// Called by Palette for the colours it is about to display: palnum is
+	// its palettes.flx number (-1 = none), world is set when the palette was
+	// loaded by number, transition when it is a clock transition into or out
+	// of a lightable palette.  Returns true and puts the colours to display
+	// in out768 when lighting takes over; false shows in768 unchanged.
+	bool filter_palette(const unsigned char* in768, int palnum, bool world, bool transition, unsigned char* out768);
 
 	// At the top of Game_window::paint, with a main actor: runs the debug
 	// hooks and gathers the lights.  True if the paint must cover the
@@ -458,6 +516,30 @@ private:
 	std::vector<Shaded_light_row>    light_rows;
 	uint64_t                         light_hash    = 0;
 	bool                             warned_lights = false;
+	// Palette state (filter_palette): the ambient palette A, the remap
+	// tables built from it, and the palette displayed while active.
+	bool                               lit_active         = false;
+	bool                               need_full          = false;    // Next paint must be full.
+	bool                               seen_world_palette = false;
+	bool                               applied_palette    = false;    // prepare_paint's one apply.
+	bool                               have_ambient       = false;
+	int                                clock_palette      = -1;    // Last palnum filtered.
+	float                              ambient_y          = 0;     // Y of A, relative to DAY.
+	float                              remap_slider       = -1;    // params.ambient of the remap.
+	std::string                        remap_game;
+	std::vector<unsigned char>         ambient_pal;    // 768: A.
+	std::vector<unsigned char>         displayed_pal;    // 768: B'.
+	std::vector<uint8_t>               remap;    // shaded_remap_size.
+	Shaded_ramp                        ramp;
+	std::vector<std::vector<uint8_t>>  ref_pals;    // shaded_ref_palettes, 768 each.
+	std::string                        refs_game;    // Game the refs were read for.
+	uint64_t                           lit_hash    = 0;    // Light hash of the last lit paint.
+	float                              lit_sliders[4]{};    // Sliders of the last lit paint.
+	std::vector<unsigned char>         unlit_frame;    // Frame before the pass, for dumps.
+	long                               relit_pixels = 0;
+	long long                          widened_need   = 0;    // prepare_paint's full paints, by cause.
+	long long                          widened_lights = 0;
+	long long                          widened_scroll = 0;
 	// Headless debug hooks (EXULT_SHADED_HOUR, EXULT_SHADED_TELEPORT).
 	int  pending_hour     = -1;
 	bool pending_teleport = false;
@@ -500,9 +582,12 @@ private:
 						  const Game_object& source, const Game_object& owner, const Shaded_light_entry& entry,
 						  Shaded_light_row row, bool carried);
 	void               shift(int dx, int dy);
-	int                light_pass(const Shaded_rect& r, uint8_t* levels, bool threaded);
+	int                light_pass(const Shaded_rect& r, uint8_t* levels, bool threaded, unsigned char* frame = nullptr);
+	bool               load_refs();
+	void               set_lit(bool on);
 	void           build_lut(uint8_t* lut) const;
 	void           dump(Image_window8& win, int number, bool view, bool full);
+	void           write_lighting_info(std::ostream& info);
 	void           report_timing() const;
 };
 
