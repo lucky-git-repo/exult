@@ -3712,6 +3712,52 @@ void Shaded_light::dump(Image_window8& win, int number, bool view, bool full) {
 			}
 		}
 	}
+	// Rounded pixels within reach of a light (the nearest one not their
+	// own): their mean light level where the normal faces it (n.l > 0.3)
+	// and where it faces away (n.l < -0.1).
+	long   lit_toward = 0, lit_away = 0;
+	double level_toward = 0, level_away = 0;
+	if (params.bins_x > 0 && params.bins_y > 0 && buffers.bin_offsets.size() > static_cast<size_t>(params.bins_x * params.bins_y)) {
+		for (int y = 0; y < gh; y++) {
+			for (int x = 0; x < gw; x++) {
+				const int idx = buffers.index(x, y);
+				if ((buffers.facing_map[idx] & shaded_face_mask) != shaded_face_rounded) {
+					continue;
+				}
+				const Shaded_point   p   = Pixel_world(buffers, params, x, y);
+				const Shaded_normalf n   = Shaded_pixel_normal(buffers, idx, shaded_face_rounded);
+				const int            id  = buffers.object_ids[idx];
+				const int            bin = std::clamp(y / params.bin_size, 0, params.bins_y - 1) * params.bins_x
+								+ std::clamp(x / params.bin_size, 0, params.bins_x - 1);
+				float best = 1e30f, dot = 0.0f;
+				for (uint32_t k = buffers.bin_offsets[bin]; k < buffers.bin_offsets[bin + 1]; k++) {
+					const Shaded_light_record& l = lights[buffers.bin_lights[k]];
+					if (l.object_id == id || (l.flags & (shaded_light_area | shaded_light_off | shaded_light_directional))) {
+						continue;
+					}
+					const float dx = Shaded_wrap_delta(l.x - p.x);
+					const float dy = Shaded_wrap_delta(l.y - p.y);
+					const float dz = (l.z - p.z) * params.tiles_per_lift;
+					const float d2 = dx * dx + dy * dy + dz * dz;
+					const float r  = l.radius * params.radius_scale;
+					if (d2 < r * r && d2 < best && d2 > 1e-6f) {
+						best = d2;
+						dot  = (n.x * dx + n.y * dy + n.z * dz) / std::sqrt(d2);
+					}
+				}
+				if (best >= 1e30f) {
+					continue;
+				}
+				if (dot > 0.3f) {
+					lit_toward++;
+					level_toward += buffers.light_levels[idx];
+				} else if (dot < -0.1f) {
+					lit_away++;
+					level_away += buffers.light_levels[idx];
+				}
+			}
+		}
+	}
 	long kinds[shaded_volume_kinds] = {};    // Fitted volumes by kind.
 	for (const Shaded_object_volume& v : buffers.object_volumes) {
 		kinds[std::clamp(v.kind, 0, shaded_volume_kinds - 1)]++;
@@ -3735,7 +3781,10 @@ void Shaded_light::dump(Image_window8& win, int number, bool view, bool full) {
 		 << "clamped " << clamped_px << "\n"
 		 << "rounded objects " << kinds[1] + kinds[2] + kinds[3] + kinds[4] << " (figure " << kinds[1] << " round " << kinds[2]
 		 << " upright " << kinds[3] << " tree " << kinds[4] << ")\n"
-		 << "rounded pixels rebuilt outside their fitted volume " << rounded_outside << "\n";
+		 << "rounded pixels rebuilt outside their fitted volume " << rounded_outside << "\n"
+		 << "rounded pixels near a light facing it " << lit_toward << " mean level "
+		 << (lit_toward > 0 ? level_toward / static_cast<double>(lit_toward) : 0.0) << ", facing away " << lit_away
+		 << " mean level " << (lit_away > 0 ? level_away / static_cast<double>(lit_away) : 0.0) << "\n";
 	if (main_actor_id != shaded_id_none && main_actor_id != shaded_id_overflow) {
 		const Shaded_object_record& a = buffers.objects[main_actor_id - 1];
 		// The box spans tiles (tx + 1 - xtiles .. tx + 1) and lifts tz .. tz + ztiles.
