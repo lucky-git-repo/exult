@@ -2538,7 +2538,7 @@ void Shaded_light::check_shadows(const Shaded_rect& r) {
 	}
 	const long pixels = static_cast<long>(samples);
 	out << "check grid field error " << (pairs > 0 ? 100.0 * static_cast<double>(off) / static_cast<double>(pairs) : 0.0)
-		<< "% of " << pairs << " (pixel, light) pairs at " << pixels << " lit pixels\n";
+		<< "% of " << pairs << " (pixel, light) pairs at " << pixels << " lit pixels (of " << lit.size() << ")\n";
 	shadow_info = out.str();
 }
 
