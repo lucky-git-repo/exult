@@ -282,6 +282,10 @@ constexpr std::string_view shaded_grid_bg_text = R"txt(
 
 %%endsection
 %%section canopy_shapes
+# Ours, not from Dominus: solid tree shapes seen in the occlusion grid
+# dumps (item names from the info files), as 50 % cover.
+# tree (Trinsic)
+:453/-1/50
 %%endsection
 )txt";
 
