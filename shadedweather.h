@@ -260,6 +260,16 @@ constexpr float shaded_flash_elevation  = 50.0f;    // Degrees.
 constexpr float shaded_flash_top        = static_cast<float>(shaded_grid_lifts);
 constexpr int   shaded_flash_dump_first = 100;    // Number of the first flash dump.
 
+/*
+ *  The light level of a rain drop or snowflake pixel: the surface level
+ *  beneath it (surface) under cover, the light scattered at its screen
+ *  position (scattered: the sky and the lamps, no facing, no shadows) in
+ *  the open, and between them as open (0..1) as the surface is.
+ */
+inline float Shaded_particle_level(float surface, float scattered, float open) {
+	return surface + (scattered - surface) * open;
+}
+
 namespace Shaded_cpu {
 	// The sky map of a grid volume (size_x x size_y): 255 for columns open
 	// to the sky, and under cover 255 * (1 - d / fade_tiles) (at least 0)
@@ -292,6 +302,10 @@ namespace Shaded_cpu {
 	// DAY[i] mixed k / 7 of the way to LIGHTNING[i]; row 0, index 0 and
 	// the cycling colours are left as they are.
 	void build_flash_table(const uint8_t* day768, const uint8_t* lightning768, uint8_t* table);
+	// Mark every pixel an RLE frame (a drop or flake) paints at (xoff,
+	// yoff), translucent ones too, as 1 in particle_mask, clipped to clip.
+	void mark_spans(
+			Shaded_scene_buffers& buf, const Shaded_rect& clip, const unsigned char* rle, int xoff, int yoff);
 }    // namespace Shaded_cpu
 
 // Synthetic tests over hand-built volumes; prints SHADED-WEATHER: TEST

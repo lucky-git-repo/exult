@@ -316,6 +316,23 @@ void Shaded_cpu::build_flash_table(const uint8_t* day768, const uint8_t* lightni
 }
 
 /*
+ *  The pixels a rain drop or snowflake paints, translucent ones too.
+ */
+
+void Shaded_cpu::mark_spans(
+		Shaded_scene_buffers& buf, const Shaded_rect& clip, const unsigned char* rle, int xoff, int yoff) {
+	const int right  = clip.x + clip.w;
+	const int bottom = clip.y + clip.h;
+	For_rle_pixels(rle, [&](int x, int y) {
+		const int px = xoff + x;
+		const int py = yoff + y;
+		if (px >= clip.x && px < right && py >= clip.y && py < bottom) {
+			buf.particle_mask[static_cast<size_t>(buf.index(px, py))] = 1;
+		}
+	});
+}
+
+/*
  *  Synthetic tests: a roofed room with a doorway, a closed room, and a
  *  hand-made square cloud frame; with the game's palettes, the fog and
  *  flash tables.
@@ -500,6 +517,13 @@ int Shaded_weather_selftest(const uint8_t* day768, const uint8_t* fog768, const 
 	report(t_door == 1.0f && t_back == 0.0f, "flash-grid-through-doorway",
 		   "T out=" + Fmt(t_door) + " T back under the roof=" + Fmt(t_back));
 	report(t_outside == 1.0f, "flash-grid-outside-doorway", "T=" + Fmt(t_outside));
+	// Rain and snow: under cover a drop keeps the surface's level, in the
+	// open it takes the scattered light.
+	const float p_covered = Shaded_particle_level(0.3f, 0.8f, 0.0f);
+	const float p_open    = Shaded_particle_level(0.3f, 0.8f, 1.0f);
+	const float p_half    = Shaded_particle_level(0.3f, 0.8f, 0.5f);
+	report(p_covered == 0.3f && p_open == 0.8f && std::abs(p_half - 0.55f) < 1e-6f, "particle-level",
+		   "covered " + Fmt(p_covered) + " open " + Fmt(p_open) + " half " + Fmt(p_half));
 	if (day768 && lightning768) {
 		std::vector<uint8_t> table(shaded_flash_table_size);
 		Shaded_cpu::build_flash_table(day768, lightning768, table.data());
