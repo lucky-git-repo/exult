@@ -1,0 +1,111 @@
+#	Exult shaded light table for Serpent Isle.
+#
+#	How each light source lights the world when the shaded light renderer
+#	(config/video/shaded_light/enabled) is on.  Rows only apply to objects
+#	the engine already treats as lights, that is shapes with a light_data
+#	row in shape_info.txt (or the light flag); a mod makes a new light
+#	source there, as before, and tunes it here.
+#
+#	A mod overrides rows with its own <PATCH>/shaded_light.txt, which only
+#	needs the rows it changes (same shape and frame replace a row here).
+#
+#	Format
+#		:shape/frame/radius/brightness/red/green/blue/height/flags
+#
+#	frame		-1 = every frame not listed for that shape.  Frames are
+#				matched after masking with 31, as for light_data.
+#	radius		In tiles.
+#	brightness	Percent; 100 = a torch.
+#	red/green/blue	Colour of the light, 0-255.  Only used where the
+#				renderer can show colour; the 8-bit path uses
+#				brightness only.
+#	height		Lifts above the object's base; -1 = top of its 3D box.
+#	flags		Sum of: 1 = area light (even light over its radius,
+#				horizontal distance only, lighting surfaces from its
+#				lift to 6 lifts above), 2 = off (the shape gives no
+#				shaded light).
+#
+#	Lights without a row use the formula these rows were made with, where
+#	b is the shape's light_data brightness (candle 1, torch 5, lamp 7):
+#		radius 3 + b, brightness 50 + 10 * b, colour 255/214/170,
+#		height -1, flags 0.
+#
+%%section version
+:1
+%%endsection
+%%section lights
+#	Light.
+:198/-1/6/80/255/214/170/-1/0
+#	Fire.
+:289/-1/10/120/255/214/170/-1/0
+#	Lit light source.
+:338/2/5/70/255/214/170/-1/0
+:338/3/8/100/255/214/170/-1/0
+:338/4/8/100/255/214/170/-1/0
+:338/5/8/100/255/214/170/-1/0
+:338/7/5/70/255/214/170/-1/0
+:338/8/5/70/255/214/170/-1/0
+:338/9/5/70/255/214/170/-1/0
+:338/10/8/100/255/214/170/-1/0
+:338/11/8/100/255/214/170/-1/0
+:338/12/5/70/255/214/170/-1/0
+:338/-1/4/60/255/214/170/-1/0
+#	Lit sconce.
+:435/-1/8/100/255/214/170/-1/0
+#	Lit lamp.
+:526/-1/10/120/255/214/170/-1/0
+#	Lightning whip.
+:549/-1/8/100/255/214/170/-1/0
+#	Fire sword.
+:551/-1/8/100/255/214/170/-1/0
+#	Firedoom staff.
+:553/-1/8/100/255/214/170/-1/0
+#	Lit torch.
+:701/-1/8/100/255/214/170/-1/0
+#	Firepit.
+:739/1/5/70/255/214/170/-1/0
+:739/2/7/90/255/214/170/-1/0
+:739/3/9/110/255/214/170/-1/0
+#	Flaming oil.
+:782/-1/8/100/255/214/170/-1/0
+#	Campfire.
+:796/-1/10/120/255/214/170/-1/0
+#	Campfire.
+:825/-1/10/120/255/214/170/-1/0
+#	Firedoom staff.
+:926/-1/8/100/255/214/170/-1/0
+#	Burning urn.
+:998/-1/10/120/255/214/170/-1/0
+#	Helm of light, when not being worn.
+:1013/-1/8/100/255/214/170/-1/0
+#	Not original light sources:
+#	Flame thrower trap.
+:159/1/6/80/255/214/170/-1/0
+:159/2/6/80/255/214/170/-1/0
+:159/3/10/120/255/214/170/-1/0
+:159/4/8/100/255/214/170/-1/0
+:159/5/8/100/255/214/170/-1/0
+:159/6/8/100/255/214/170/-1/0
+:159/7/8/100/255/214/170/-1/0
+:159/8/8/100/255/214/170/-1/0
+:159/9/8/100/255/214/170/-1/0
+:159/10/8/100/255/214/170/-1/0
+:159/11/8/100/255/214/170/-1/0
+:159/12/10/120/255/214/170/-1/0
+:159/13/6/80/255/214/170/-1/0
+:159/14/6/80/255/214/170/-1/0
+:159/15/6/80/255/214/170/-1/0
+#	Phoenix egg.
+:649/1/4/60/255/214/170/-1/0
+#	Stove.
+:664/1/4/60/255/214/170/-1/0
+#	Baking hearth.
+:831/-1/4/60/255/214/170/-1/0
+#	Moongate.
+:864/-1/4/60/255/214/170/-1/0
+#	Hidden light circles (provisional, to be confirmed from the dump light
+#	list): even area light.  Names from Exult's docs/siitems.txt
+#	(336 "light source", 440 "light").
+:336/-1/8/35/255/240/210/0/1
+:440/-1/8/35/255/240/210/0/1
+%%endsection
