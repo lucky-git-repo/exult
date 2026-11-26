@@ -75,6 +75,7 @@
 #include "paths.h"
 #include "scene_layer.h"
 #include "schedule.h"
+#include "shadedgrid.h"
 #include "spellbook.h"
 #include "touchui.h"
 #include "ucmachine.h"
@@ -945,6 +946,7 @@ void Game_window::clear_world(bool restoremapedit) {
 	cheat.set_map_editor(false);
 	Combat::resume();
 	tqueue->clear();    // Remove all entries.
+	Shaded_grid_world_cleared();
 	clear_dirty();
 	Usecode_script::clear();    // Clear out all scheduled usecode.
 	// Most NPCs were deleted when the map is cleared; we have to deal with some
@@ -1112,6 +1114,7 @@ void Game_window::set_scrolls(int newscrolltx, int newscrollty) {
 	set_in_dungeon(nlist->has_dungeon() ? nlist->is_dungeon(tx, ty) : 0);
 	set_ice_dungeon(nlist->is_ice_dungeon(tx, ty));
 	send_location();    // Tell ExultStudio.
+	Shaded_grid_view_changed();
 }
 
 /*

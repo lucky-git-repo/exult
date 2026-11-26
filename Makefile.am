@@ -112,6 +112,9 @@ EXULTSOURCES =	\
 	schedule.h	\
 	shadedlight.cc	\
 	shadedlight.h	\
+	shadedgrid.cc	\
+	shadedgrid.h	\
+	shadedgrid_data.h	\
 	shapeid.cc	\
 	shapeid.h	\
 	singles.h	\
