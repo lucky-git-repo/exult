@@ -39,6 +39,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <map>
 #include <string>
 #include <type_traits>
 #include <unordered_map>
@@ -128,6 +129,58 @@ struct Shaded_object_record {
 };
 
 static_assert(sizeof(Shaded_object_record) == 32);
+
+// Light flags (Shaded_light_record::flags).  Area and off are also the
+// flags column of shaded_light.txt.
+constexpr int32_t shaded_light_area    = 1;    // Even light, horizontal distance.
+constexpr int32_t shaded_light_off     = 2;    // Gives no shaded light.
+constexpr int32_t shaded_light_carried = 4;    // Readied by a party member.
+// Most lights in one paint.
+constexpr int shaded_max_lights = 256;
+
+/*
+ *  One light of the current paint, as uploaded to a storage buffer later
+ *  (std430).  The sliders are not applied: radius and intensity are the
+ *  table row's.
+ */
+struct Shaded_light_record {
+	float   x, y, z;              // World position: tiles, tiles, lifts.
+	float   radius;               // In tiles.
+	float   red, green, blue;     // 0..1.
+	float   intensity;            // Row brightness / 100 (1 = a torch).
+	int32_t flags;                // shaded_light_*.
+	int32_t object_id;            // Record id of the self-lit object (0 = none).
+	int32_t shape, frame;         // Of the light object.
+};
+
+static_assert(sizeof(Shaded_light_record) == 48);
+static_assert(std::is_trivially_copyable_v<Shaded_light_record> && std::is_standard_layout_v<Shaded_light_record>);
+
+/*
+ *  One row of shaded_light.txt.
+ */
+struct Shaded_light_entry {
+	int radius;        // Tiles.
+	int brightness;    // Percent; 100 = a torch.
+	int red, green, blue;    // 0-255.
+	int height;        // Lifts above the base; -1 = top of the 3D box.
+	int flags;         // shaded_light_area, shaded_light_off.
+};
+
+/*
+ *  The row a light without its own row gets, from its light_data
+ *  brightness b (candle 1, torch 5, lamp 7).
+ */
+constexpr Shaded_light_entry Shaded_default_light(int b) {
+	return Shaded_light_entry{3 + b, 50 + 10 * b, 255, 214, 170, -1, 0};
+}
+
+// Where a light's row came from.
+enum class Shaded_light_row : uint8_t {
+	exact,       // Table row for the shape and frame.
+	wildcard,    // Table row for the shape, frame -1.
+	formula      // No row: Shaded_default_light.
+};
 
 /*
  *  A rectangle in game-area pixels.
@@ -251,6 +304,15 @@ public:
 		return record_on;
 	}
 
+	// The shaded light option (config, or a dump run) is on.
+	bool lighting_enabled() const {
+		return lighting_on;
+	}
+
+	// At the top of Game_window::paint, with a main actor: runs the debug
+	// hooks and gathers the lights.  True if the paint must cover the
+	// whole game area.
+	bool prepare_paint();
 	// Around Game_render::paint_map in Game_window::paint.
 	void begin_paint(Image_window8& win, bool full);
 	void end_paint(Image_window8& win, bool full);
@@ -273,6 +335,10 @@ public:
 		return buffers;
 	}
 
+	const std::vector<Shaded_light_record>& get_lights() const {
+		return lights;
+	}
+
 	void shape_painted(int xoff, int yoff, Shape_frame& shape, bool translucent, int xfcnt) override;
 	~Shaded_light() override;
 
@@ -289,6 +355,29 @@ private:
 	bool                  record_on = false;    // Config or dump.
 	std::unordered_map<const Game_object*, uint16_t> object_index;
 	uint16_t                                         main_actor_id = shaded_id_none;
+	// Config (config/video/shaded_light/...); sliders as fractions.
+	bool  lighting_on  = false;
+	float cfg_softness = 1.0f;
+	float cfg_facing   = 0.5f;
+	bool  cfg_dither   = true;
+	int   cfg_threads  = 0;    // 0 = auto.
+	// The light table (shaded_light.txt), keyed by (shape, frame or -1).
+	std::map<std::pair<int, int>, Shaded_light_entry> light_table;
+	std::string                                       table_game;    // Game and mod it was read for.
+	bool                                              table_loaded = false;
+	int                                               table_radius = 0;    // Largest radius, tiles.
+	// Lights of the current paint: the object lit by each (the bearer for
+	// carried lights), the light object itself and where its row came from.
+	std::vector<Shaded_light_record> lights;
+	std::vector<const Game_object*>  light_objects;
+	std::vector<const Game_object*>  light_sources;
+	std::vector<Shaded_light_row>    light_rows;
+	uint64_t                         light_hash    = 0;
+	bool                             warned_lights = false;
+	// Headless debug hooks (EXULT_SHADED_HOUR, EXULT_SHADED_TELEPORT).
+	int  pending_hour     = -1;
+	bool pending_teleport = false;
+	int  teleport_to[3]   = {0, 0, 0};
 	// Headless dumps (EXULT_SHADED_DUMP).
 	std::string      dump_dir;
 	std::vector<int> dump_at;    // ms after the first recorded full paint.
@@ -312,9 +401,17 @@ private:
 	bool              warned_backend  = false;
 
 	Shaded_light();
-	Shaded_backend backend();
-	bool           setup_buffers(Image_window8& win);
-	void           shift(int dx, int dy);
+	Shaded_backend     backend();
+	bool               setup_buffers(Image_window8& win);
+	void               read_config();
+	void               run_debug_hooks();
+	void               load_table();
+	Shaded_light_entry find_row(int shape, int frame, int brightness, Shaded_light_row& row) const;
+	void               gather_lights();
+	void               add_light(
+						  const Game_object& source, const Game_object& owner, const Shaded_light_entry& entry,
+						  Shaded_light_row row, bool carried);
+	void               shift(int dx, int dy);
 	void           build_lut(uint8_t* lut) const;
 	void           dump(Image_window8& win, int number, bool view, bool full);
 	void           report_timing() const;

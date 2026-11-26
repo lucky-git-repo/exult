@@ -334,6 +334,15 @@ void Game_window::paint(
 	if (!win->ready()) {
 		return;
 	}
+	if (main_actor && Shaded_light::get().prepare_paint()) {
+		// The lighting changed, so the whole game area is painted again.
+		const int x1 = std::max(x + w, get_width());
+		const int y1 = std::max(y + h, get_height());
+		x            = std::min(x, 0);
+		y            = std::min(y, 0);
+		w            = x1 - x;
+		h            = y1 - y;
+	}
 	// This will adjust and clip the rectangle as appropriate, it may end up
 	// bigger or smaller
 	win->BeginPaintIntoGuardBand(&x, &y, &w, &h);

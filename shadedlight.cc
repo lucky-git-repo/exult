@@ -26,13 +26,23 @@
 
 #include "Configuration.h"
 #include "actors.h"
+#include "chunks.h"
+#include "data/exult_bg_flx.h"
+#include "data/exult_si_flx.h"
+#include "data_utils.h"
+#include "exceptions.h"
 #include "exult.h"
+#include "game.h"
+#include "gameclk.h"
+#include "gamemap.h"
 #include "gamewin.h"
 #include "ibuf8.h"
 #include "ignore_unused_variable_warning.h"
 #include "iwin8.h"
 #include "palette.h"
+#include "ready.h"
 #include "shapeinf.h"
+#include "utils.h"
 
 #include <algorithm>
 #include <cmath>
@@ -66,6 +76,10 @@ static_assert(Shaded_classify_box(-3, -9, 8, 8, 0).facing == (shaded_face_ground
 static_assert(Shaded_classify_box(-10, -6, 8, 16, 16).facing == shaded_face_south);
 static_assert(Shaded_classify_box(-6, -10, 16, 8, 16).facing == shaded_face_east);
 static_assert(Shaded_classify_box(-10, -6, 8, 16, 16).dz_px == Shaded_classify_box(-6, -10, 16, 8, 16).dz_px);
+// The default rows: candle, torch and lamp.
+static_assert(Shaded_default_light(1).radius == 4 && Shaded_default_light(1).brightness == 60);
+static_assert(Shaded_default_light(5).radius == 8 && Shaded_default_light(5).brightness == 100);
+static_assert(Shaded_default_light(7).radius == 10 && Shaded_default_light(7).brightness == 120);
 
 namespace {
 	constexpr int lut_size = 64;    // False colour codes per view.
@@ -202,6 +216,65 @@ namespace {
 		return true;
 	}
 #endif
+
+	using Light_table = std::map<std::pair<int, int>, Shaded_light_entry>;
+
+	/*
+	 *  Reads the lights section of shaded_light.txt:
+	 *      shape/frame/radius/brightness/red/green/blue/height/flags
+	 *  Patch rows replace static rows with the same shape and frame.
+	 */
+	class Shaded_light_reader final : public Base_reader {
+		Light_table& table;
+
+	protected:
+		void read_data(std::istream& in, size_t index, int version, bool patch, Exult_Game game, bool binary) override {
+			ignore_unused_variable_warning(index, version, patch, game, binary);
+			const int shape = ReadInt(in, -1);
+			int       frame = ReadInt(in, -1);
+			if (shape < 0) {
+				return;
+			}
+			frame = frame < 0 ? -1 : (frame & 0xff);
+			// Missing fields take a torch's row.
+			const Shaded_light_entry def = Shaded_default_light(5);
+			Shaded_light_entry       entry;
+			entry.radius     = std::max(ReadInt(in, def.radius), 0);
+			entry.brightness = std::max(ReadInt(in, def.brightness), 0);
+			entry.red        = std::clamp(ReadInt(in, def.red), 0, 255);
+			entry.green      = std::clamp(ReadInt(in, def.green), 0, 255);
+			entry.blue       = std::clamp(ReadInt(in, def.blue), 0, 255);
+			entry.height     = ReadInt(in, def.height);
+			entry.flags      = ReadInt(in, def.flags) & (shaded_light_area | shaded_light_off);
+
+			table[std::make_pair(shape, frame)] = entry;
+		}
+
+	public:
+		explicit Shaded_light_reader(Light_table& t) : Base_reader(false), table(t) {}
+	};
+
+	// FNV-1a over 32-bit values.
+	void Hash_add(uint64_t& hash, int32_t value) {
+		auto v = static_cast<uint32_t>(value);
+		for (int i = 0; i < 4; i++) {
+			hash ^= v & 0xffu;
+			hash *= 1099511628211ull;
+			v >>= 8;
+		}
+	}
+
+	const char* Row_name(Shaded_light_row row) {
+		switch (row) {
+		case Shaded_light_row::exact:
+			return "table exact";
+		case Shaded_light_row::wildcard:
+			return "table wildcard";
+		case Shaded_light_row::formula:
+			break;
+		}
+		return "default";
+	}
 }    // namespace
 
 Shaded_rect Shaded_scene_buffers::bounds() const {
@@ -338,9 +411,16 @@ Shaded_light& Shaded_light::get() {
 }
 
 Shaded_light::Shaded_light() {
-	bool enabled = false;
-	if (config) {
-		config->value("config/video/shaded_light", enabled, false);
+	read_config();
+	bool enabled = lighting_on;
+	if (const char* hour = std::getenv("EXULT_SHADED_HOUR"); hour && *hour) {
+		pending_hour = std::clamp(std::atoi(hour), 0, 23);
+	}
+	if (const char* tele = std::getenv("EXULT_SHADED_TELEPORT"); tele && *tele) {
+		pending_teleport = std::sscanf(tele, "%d,%d,%d", &teleport_to[0], &teleport_to[1], &teleport_to[2]) == 3;
+		if (!pending_teleport) {
+			std::cout << "SHADED: EXULT_SHADED_TELEPORT wants x,y,z, not " << tele << std::endl;
+		}
 	}
 	if (const char* dir = std::getenv("EXULT_SHADED_DUMP"); dir && *dir) {
 		dump_dir = dir;
@@ -350,7 +430,8 @@ Shaded_light::Shaded_light() {
 			std::cout << "SHADED: could not create dump folder " << dump_dir << ": " << ec.message() << std::endl;
 			dump_dir.clear();
 		} else {
-			enabled = true;
+			enabled     = true;
+			lighting_on = true;
 		}
 	}
 	const char* at = std::getenv("EXULT_SHADED_DUMP_AT");
@@ -418,6 +499,280 @@ Shaded_view Shaded_light::cycle_view() {
 	}
 	params.view = (params.view + 1) % static_cast<int>(Shaded_view::count);
 	return static_cast<Shaded_view>(params.view);
+}
+
+/*
+ *  Read config/video/shaded_light/...; percentages become fractions.
+ */
+
+void Shaded_light::read_config() {
+	if (!config) {
+		return;
+	}
+	const std::string base = "config/video/shaded_light/";
+	bool              enabled;
+	bool              old_enabled;    // Stage 1 form: config/video/shaded_light = yes.
+	config->value(base + "enabled", enabled, false);
+	config->value("config/video/shaded_light", old_enabled, false);
+	lighting_on  = enabled || old_enabled;
+	auto percent = [&](const char* key, int def) {
+		int value;
+		config->value(base + key, value, def);
+		return static_cast<float>(std::max(value, 0)) / 100.0f;
+	};
+	params.brightness   = percent("brightness", 100);
+	params.radius_scale = percent("radius", 100);
+	params.ambient      = percent("ambient", 100);
+	cfg_softness        = std::max(percent("softness", 100), 0.01f);
+	cfg_facing          = std::min(percent("facing", 50), 1.0f);
+	config->value(base + "dither", cfg_dither, true);
+	config->value(base + "threads", cfg_threads, 0);
+	cfg_threads = std::max(cfg_threads, 0);
+}
+
+/*
+ *  Headless debug hooks, once each.  The flags are cleared first, as both
+ *  can paint again from inside.
+ */
+
+void Shaded_light::run_debug_hooks() {
+	Game_window* gwin = Game_window::get_instance();
+	if (pending_hour >= 0) {
+		const int hour = pending_hour;
+		pending_hour   = -1;
+		Game_clock* clock = gwin->get_clock();
+		clock->set_hour(hour);
+		clock->set_minute(0);
+		clock->set_ticks(0);
+		clock->reset_palette();
+		gwin->set_all_dirty();
+		std::cout << "SHADED: hour set to " << hour << std::endl;
+	}
+	if (pending_teleport) {
+		pending_teleport = false;
+		gwin->teleport_party(Tile_coord(teleport_to[0], teleport_to[1], teleport_to[2]));
+		std::cout << "SHADED: teleported to " << teleport_to[0] << "," << teleport_to[1] << "," << teleport_to[2] << std::endl;
+	}
+}
+
+/*
+ *  Read shaded_light.txt (bundled, then the patch folder's) when the game
+ *  or mod has changed.  Without a file only the formula is used.
+ */
+
+void Shaded_light::load_table() {
+	const Exult_Game  game = Game::get_game_type();
+	const std::string key  = std::to_string(static_cast<int>(game)) + "/" + Game::get_gametitle() + "/" + Game::get_modtitle();
+	if (table_loaded && key == table_game) {
+		return;
+	}
+	table_loaded = true;
+	table_game   = key;
+	light_table.clear();
+	int resource = -1;
+	if (game == BLACK_GATE) {
+		resource = EXULT_BG_FLX_SHADED_LIGHT_TXT;
+	} else if (game == SERPENT_ISLE) {
+		resource = EXULT_SI_FLX_SHADED_LIGHT_TXT;
+	}
+	std::array<std::string_view, 1> sections{"lights"};
+	std::array readers = make_unique_array<Base_reader>(std::make_unique<Shaded_light_reader>(light_table));
+	static_assert(sections.size() == readers.size());
+	try {
+		Read_text_data_file("shaded_light", readers, sections, false, game, resource);
+	} catch (const file_open_exception& e) {
+		std::cout << "SHADED: no light table (" << e.what() << "), using the default formula" << std::endl;
+	}
+	table_radius = 0;
+	for (const auto& [id, entry] : light_table) {
+		table_radius = std::max(table_radius, entry.radius);
+	}
+	std::cout << "SHADED: light table has " << light_table.size() << " rows" << std::endl;
+}
+
+/*
+ *  The row for a light: exact (shape, frame & 31), then (shape, -1), else
+ *  the formula from its light_data brightness.
+ */
+
+Shaded_light_entry Shaded_light::find_row(int shape, int frame, int brightness, Shaded_light_row& row) const {
+	auto it = light_table.find(std::make_pair(shape, frame & 31));
+	if (it != light_table.end()) {
+		row = Shaded_light_row::exact;
+		return it->second;
+	}
+	it = light_table.find(std::make_pair(shape, -1));
+	if (it != light_table.end()) {
+		row = Shaded_light_row::wildcard;
+		return it->second;
+	}
+	row = Shaded_light_row::formula;
+	return Shaded_default_light(brightness);
+}
+
+/*
+ *  Add a light from source (the light object) placed on owner (the same
+ *  object, or the party member carrying it).
+ */
+
+void Shaded_light::add_light(
+		const Game_object& source, const Game_object& owner, const Shaded_light_entry& entry, Shaded_light_row row,
+		bool carried) {
+	if (lights.size() >= static_cast<size_t>(shaded_max_lights)) {
+		if (!warned_lights) {
+			warned_lights = true;
+			std::cout << "SHADED: over " << shaded_max_lights << " lights in view, the rest are left out" << std::endl;
+		}
+		return;
+	}
+	Game_window* gwin = Game_window::get_instance();
+	int          ox, oy;
+	gwin->get_shape_location(&owner, ox, oy);
+	const Tile_coord  t     = owner.get_tile();
+	const Shape_info& info  = owner.get_info();
+	const int         frame = owner.get_framenum();
+	// (ox, oy) is the pixel up and left of the box's SE bottom corner, with
+	// the smooth-scroll and barge offsets the painter used; undoing
+	// Get_shape_location gives the corner exactly (tile tx + 1, ty + 1).
+	const float lift_px  = static_cast<float>(t.tz) * params.pixels_per_lift;
+	const float corner_x = static_cast<float>(gwin->get_scrolltx())
+						   + (static_cast<float>(ox + gwin->get_scrolltx_lo() + 1) + lift_px) / params.pixels_per_tile;
+	const float corner_y = static_cast<float>(gwin->get_scrollty())
+						   + (static_cast<float>(oy + gwin->get_scrollty_lo() + 1) + lift_px) / params.pixels_per_tile;
+	const auto  tiles    = static_cast<float>(c_num_tiles);
+	const auto  ztiles   = static_cast<float>(info.get_3d_height());
+	Shaded_light_record rec;
+	rec.x = std::fmod(corner_x - static_cast<float>(info.get_3d_xtiles(frame)) * 0.5f + tiles, tiles);
+	rec.y = std::fmod(corner_y - static_cast<float>(info.get_3d_ytiles(frame)) * 0.5f + tiles, tiles);
+	if (carried) {    // About hand height.
+		rec.z = static_cast<float>(t.tz) + 0.75f * ztiles;
+	} else {
+		rec.z = static_cast<float>(t.tz) + (entry.height >= 0 ? static_cast<float>(entry.height) : ztiles);
+	}
+	rec.radius    = static_cast<float>(entry.radius);
+	rec.red       = static_cast<float>(entry.red) / 255.0f;
+	rec.green     = static_cast<float>(entry.green) / 255.0f;
+	rec.blue      = static_cast<float>(entry.blue) / 255.0f;
+	rec.intensity = static_cast<float>(entry.brightness) / 100.0f;
+	rec.flags     = (entry.flags & (shaded_light_area | shaded_light_off)) | (carried ? shaded_light_carried : 0);
+	rec.object_id = shaded_id_none;    // Resolved once the paint has recorded it.
+	rec.shape     = source.get_shapenum();
+	rec.frame     = source.get_framenum();
+	lights.push_back(rec);
+	light_objects.push_back(&owner);
+	light_sources.push_back(&source);
+	light_rows.push_back(row);
+}
+
+/*
+ *  The lights of this paint: lights in the chunks on screen and as far
+ *  around as the largest radius reaches, then the party's carried lights.
+ */
+
+void Shaded_light::gather_lights() {
+	Game_window* gwin = Game_window::get_instance();
+	Game_map*    map  = gwin->get_map();
+	lights.clear();
+	light_objects.clear();
+	light_sources.clear();
+	light_rows.clear();
+	const float max_radius = static_cast<float>(std::max(table_radius, Shaded_default_light(8).radius)) * params.radius_scale;
+	const int   reach      = std::min(static_cast<int>(std::ceil(max_radius)), 32);
+	const int   margin     = (reach + c_tiles_per_chunk - 1) / c_tiles_per_chunk;
+	// Chunks as Game_render::paint_map walks them, widened by margin.
+	auto range = [margin](int scroll, int pixels, int& start, int& count) {
+		start          = (scroll - 1 + c_num_tiles) / c_tiles_per_chunk - c_num_chunks - margin;
+		const int stop = 2 + (scroll + (pixels + c_tilesize - 2) / c_tilesize + c_tiles_per_chunk / 2) / c_tiles_per_chunk + margin;
+		count          = std::min(stop - start, c_num_chunks);
+	};
+	int start_x, count_x, start_y, count_y;
+	range(gwin->get_scrolltx(), gwin->get_width(), start_x, count_x);
+	range(gwin->get_scrollty(), gwin->get_height(), start_y, count_y);
+	auto wrap = [](int c) {
+		return ((c % c_num_chunks) + c_num_chunks) % c_num_chunks;
+	};
+	const bool dungeon   = gwin->is_in_dungeon() != 0;
+	const int  skip_lift = gwin->get_render_skip_lift();
+	for (int j = 0; j < count_y; j++) {
+		for (int i = 0; i < count_x; i++) {
+			// Never creates chunks: one not yet read has no lights.
+			const Map_chunk* chunk = map->get_chunk_unsafe(wrap(start_x + i), wrap(start_y + j));
+			if (!chunk) {
+				continue;
+			}
+			const auto& set = dungeon ? chunk->get_dungeon_lights() : chunk->get_non_dungeon_lights();
+			for (const Game_object* obj : set) {
+				const int frame = obj->get_framenum();
+				const int b     = obj->get_info().get_object_light(frame);
+				if (b <= 0 || obj->get_lift() >= skip_lift) {
+					continue;
+				}
+				Shaded_light_row         row;
+				const Shaded_light_entry entry = find_row(obj->get_shapenum(), frame, b, row);
+				if (!(entry.flags & shaded_light_off)) {
+					add_light(*obj, *obj, entry, row, false);
+				}
+			}
+		}
+	}
+	// Carried lights: each readied light Actor::refigure_gear counts, at
+	// the bearer; a formula light if none is found.
+	static const Ready_type_Exult spots[]
+			= {head, belt, lhand, lfinger, legs, feet, rfinger, rhand, torso, amulet, earrings, cloak, gloves};
+	Actor*    party[9];
+	const int count = gwin->get_party(party, 1);
+	for (int p = 0; p < count; p++) {
+		const Actor* actor = party[p];
+		if (!actor || actor->get_light_source() <= 0 || actor->get_lift() >= skip_lift) {
+			continue;
+		}
+		bool found = false;
+		for (const auto spot : spots) {
+			const Game_object* worn = actor->get_readied(spot);
+			if (!worn) {
+				continue;
+			}
+			const Shape_info& info  = worn->get_info();
+			const int         rdy   = info.get_ready_type();
+			const int         frame = worn->get_framenum();
+			const int         b     = info.get_object_light(frame);
+			if (!info.is_light_source() || b <= 0 || (spot == belt && (rdy == lhand || rdy == rhand || rdy == both_hands))) {
+				continue;
+			}
+			found = true;
+			Shaded_light_row         row;
+			const Shaded_light_entry entry = find_row(worn->get_shapenum(), frame, b, row);
+			if (!(entry.flags & shaded_light_off)) {
+				add_light(*worn, *actor, entry, row, true);
+			}
+		}
+		if (!found) {
+			add_light(*actor, *actor, Shaded_default_light(actor->get_light_source()), Shaded_light_row::formula, true);
+		}
+	}
+	// Hash of what the lighting depends on, positions to 1/16 tile.
+	uint64_t hash = 14695981039346656037ull;
+	for (const Shaded_light_record& rec : lights) {
+		Hash_add(hash, static_cast<int32_t>(std::lround(rec.x * 16.0f)));
+		Hash_add(hash, static_cast<int32_t>(std::lround(rec.y * 16.0f)));
+		Hash_add(hash, static_cast<int32_t>(std::lround(rec.z * 16.0f)));
+		Hash_add(hash, static_cast<int32_t>(std::lround(rec.radius * 16.0f)));
+		Hash_add(hash, static_cast<int32_t>(std::lround(rec.intensity * 256.0f)));
+		Hash_add(hash, rec.flags);
+	}
+	Hash_add(hash, static_cast<int32_t>(lights.size()));
+	light_hash = hash;
+}
+
+bool Shaded_light::prepare_paint() {
+	if (!record_on && !lighting_on) {
+		return false;
+	}
+	run_debug_hooks();
+	load_table();
+	gather_lights();
+	// Nothing is lit from the lights yet, so no paint needs widening.
+	return false;
 }
 
 /*
@@ -909,6 +1264,30 @@ void Shaded_light::dump(Image_window8& win, int number, bool view, bool full) {
 			 << "avatar inside box " << (inside ? "yes" : "no") << "\n";
 	} else {
 		info << "avatar not recorded\n";
+	}
+	// The light list, with the pixels its lit object painted in this frame
+	// (0 = not painted: hidden, or off screen).
+	std::vector<long> id_pixels(buffers.objects.size() + 1, 0);
+	for (int y = 0; y < gh; y++) {
+		for (int x = 0; x < gw; x++) {
+			const uint16_t id = buffers.object_ids[buffers.index(x, y)];
+			if (id != shaded_id_overflow && id < id_pixels.size()) {
+				id_pixels[id]++;
+			}
+		}
+	}
+	info << "lights " << lights.size() << " hash " << std::hex << light_hash << std::dec << "\n";
+	for (size_t i = 0; i < lights.size(); i++) {
+		const Shaded_light_record& rec = lights[i];
+		const Tile_coord           t   = light_objects[i]->get_tile();
+		const auto                 it  = object_index.find(light_objects[i]);
+		const unsigned             id  = it != object_index.end() ? it->second : shaded_id_none;
+		const long                 px  = id != shaded_id_none && id < id_pixels.size() ? id_pixels[id] : 0;
+		info << "light " << i << " shape " << rec.shape << " frame " << rec.frame << " tile " << t.tx << "," << t.ty << ","
+			 << t.tz << " world " << rec.x << "," << rec.y << "," << rec.z << " radius " << rec.radius << " intensity "
+			 << rec.intensity << " flags " << rec.flags << " source "
+			 << ((rec.flags & shaded_light_carried) ? "carried " : "") << Row_name(light_rows[i]) << " id " << id
+			 << " pixels " << px << "\n";
 	}
 	std::cout << "SHADED: dump " << number << " written to " << prefix << "*.png (" << buffers.objects.size() << " objects)"
 			  << std::endl;
