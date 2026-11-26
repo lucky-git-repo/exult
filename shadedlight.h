@@ -1264,7 +1264,7 @@ private:
 	bool                 flash_end_pending = false;    // Ended before it was painted.
 	int                  flash_count       = 0;
 	float                flash_dir[3]      = {0.0f, 0.0f, 1.0f};
-	std::vector<uint8_t> flash_table;    // shaded_flash_table_size.
+	std::vector<uint8_t> flash_table;    // shaded_flash_table_size; built, not applied.
 	int                  flash_dumps_left  = 0;
 	int                  flash_dumps_taken = 0;
 	long                 flash_traces      = 0;    // Of the last flash pass.

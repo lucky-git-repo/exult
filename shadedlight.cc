@@ -3354,20 +3354,20 @@ int Shaded_light::light_pass(
 	if (r.w <= 0 || r.h <= 0) {
 		return 0;
 	}
-	const bool fog_on   = params.fog && fog_table.size() == shaded_fog_table_size;
-	const bool flash_on = params.flash > 0.0f && flash_table.size() == shaded_flash_table_size;
-	auto       band     = [&](int b, int bands) {
+	const bool fog_on = params.fog && fog_table.size() == shaded_fog_table_size;
+	auto       band   = [&](int b, int bands) {
 		const int y0 = r.y + r.h * b / bands;
 		const int y1 = r.y + r.h * (b + 1) / bands;
 		Shaded_cpu::light_rows(
 				buffers, params, lights.data(), buffers.bin_offsets.data(), buffers.bin_lights.data(), r, y0, y1, levels,
 				shadows, shadow_out, weather, wout);
 		if (frame && weather) {
-			// The fog table only while there is fog, the flash table only
-			// during a flash.
+			// The fog table only while there is fog.  A flash is the traced
+			// level lift alone: the flash table is not applied, as BG's
+			// LIGHTNING palette sends lit browns to DAY's magentas (0x5a).
 			Shaded_cpu::apply_weather_rows(
 					buffers, r, y0, y1, levels, remap.data(), wout ? wout->fog : nullptr, fog_on ? fog_table.data() : nullptr,
-					wout ? wout->flash : nullptr, flash_on ? flash_table.data() : nullptr, frame);
+					nullptr, nullptr, frame);
 		} else if (frame) {
 			Shaded_cpu::apply_light_rows(buffers, r, y0, y1, levels, remap.data(), frame);
 		}
