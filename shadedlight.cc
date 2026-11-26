@@ -492,15 +492,20 @@ namespace {
 	// How much an object stops light in the screen-space shadow trace:
 	// people fully (they are not in the grid); shapes the grid lets light
 	// through (glass, bars, canopy, open doors) not at all, as the grid
-	// already applies their share; other solid shapes with height fully.
-	uint8_t Screen_opacity(const Game_object& obj, const Shape_info& info, int frame) {
+	// already applies their share, except rounded ones (a tree's canopy)
+	// stop the rest of it in the shape of their volume; other solid shapes
+	// with height fully.
+	uint8_t Screen_opacity(const Game_object& obj, const Shape_info& info, int frame, Shaded_volume volume) {
 		if (obj.as_actor()) {
 			return 255;
 		}
 		const Shaded_grid* grid  = Shaded_grid::active;
 		const int          shape = obj.get_shapenum();
-		if (grid && grid->get_rules().has_shape(shape) && grid->get_rules().lookup(shape, frame).percent > 0) {
-			return 0;
+		if (grid && grid->get_rules().has_shape(shape)) {
+			const int percent = grid->get_rules().lookup(shape, frame).percent;
+			if (percent > 0) {
+				return volume == Shaded_volume::box ? 0 : static_cast<uint8_t>(255 * (100 - std::min(percent, 100)) / 100);
+			}
 		}
 		return info.is_solid() && info.get_3d_height() > 0 ? 255 : 0;
 	}
@@ -1042,7 +1047,7 @@ namespace {
 
 	// Unshadowed light of l at p on a face with normal n (no self-light),
 	// as Shaded_cpu::light_rows adds it.
-	float Unshadowed(const Shaded_light_params& params, const Shaded_light_record& l, const Shaded_point& p, const Shaded_normal& n) {
+	float Unshadowed(const Shaded_light_params& params, const Shaded_light_record& l, const Shaded_point& p, const Shaded_normalf& n) {
 		const float radius = l.radius * params.radius_scale;
 		const float r2     = radius * radius;
 		const float dx     = Shaded_wrap_delta(l.x - p.x);
@@ -1059,7 +1064,7 @@ namespace {
 		if (d2 >= r2) {
 			return 0.0f;
 		}
-		const float dot   = static_cast<float>(n.x) * dx + static_cast<float>(n.y) * dy + static_cast<float>(n.z) * dz;
+		const float dot   = n.x * dx + n.y * dy + n.z * dz;
 		const float ndotl = d2 > 1e-6f ? dot / std::sqrt(d2) : 1.0f;
 		if (ndotl <= 0.0f) {
 			return 0.0f;
@@ -1112,6 +1117,18 @@ namespace {
 			}
 			const uint8_t opacity = buf.object_opacity[id - 1];
 			if (opacity == 0) {
+				continue;
+			}
+			// A rounded object's fitted volume, relative to its centre.
+			const Shaded_object_volume& rv = buf.object_volumes[id - 1];
+			if (params.rounded && rv.kind != 0) {
+				const float rq[3] = {Shaded_wrap_delta(qx - rv.centre[0]), Shaded_wrap_delta(qy - rv.centre[1]),
+									 (qz - rv.centre[2]) * params.tiles_per_lift};
+				const float v     = Shaded_cone_visibility(Shaded_rounded_sd(rq, rv, params.tiles_per_lift), size * s / dist, hard);
+				ts                = std::min(ts, 1.0f - static_cast<float>(opacity) / 255.0f * (1.0f - v));
+				if (ts <= 0.0f) {
+					break;
+				}
 				continue;
 			}
 			// The object's box, relative to its SE bottom corner, in tiles.
@@ -1214,7 +1231,7 @@ void Shaded_cpu::screen_shadow_rows(
 			const int          col = idx - buf.origin - row * buf.stride;
 			const Shaded_point p   = Pixel_world(buf, params, col, row);
 			const int          own = buf.object_ids[idx];
-			const Shaded_normal n  = Shaded_face_normal(face);
+			const Shaded_normalf n = Shaded_pixel_normal(buf, idx, face);
 			const int          bin = std::clamp(row / params.bin_size, 0, params.bins_y - 1) * params.bins_x
 							+ std::clamp(col / params.bin_size, 0, params.bins_x - 1);
 			int   count = 0;
@@ -1413,7 +1430,7 @@ void Shaded_cpu::light_rows(
 			const float         wz   = static_cast<float>(buf.height_map[idx]) * inv_units;
 			const float         px   = base_x + static_cast<float>(x - r.x) * inv_tile + wz * lift_tile;
 			const float         py   = base_y + wz * lift_tile;
-			const Shaded_normal n    = Shaded_face_normal(face);
+			const Shaded_normalf n   = Shaded_pixel_normal(buf, idx, face);
 			const int           id   = buf.object_ids[idx];
 			const int           bin  = bin_y * params.bins_x + std::clamp(x / params.bin_size, 0, params.bins_x - 1);
 			float               sum  = 0.0f;
@@ -1464,7 +1481,7 @@ void Shaded_cpu::light_rows(
 				if (d2 >= r2) {
 					continue;
 				}
-				const float dot   = static_cast<float>(n.x) * dx + static_cast<float>(n.y) * dy + static_cast<float>(n.z) * dz;
+				const float dot   = n.x * dx + n.y * dy + n.z * dz;
 				const float ndotl = d2 > 1e-6f ? dot / std::sqrt(d2) : 1.0f;
 				if (ndotl <= 0.0f) {
 					continue;
@@ -2144,7 +2161,7 @@ bool Shaded_light::prepare_paint() {
 	}
 	// The lighting of a partial paint must match the frame around it, so
 	// any change of what it depends on paints the whole game area.
-	const float sliders[9] = {params.ambient,
+	const float sliders[11] = {params.ambient,
 							  params.brightness,
 							  params.radius_scale,
 							  params.softness,
@@ -2152,9 +2169,11 @@ bool Shaded_light::prepare_paint() {
 							  params.shadow_strength,
 							  params.shadow_softness,
 							  static_cast<float>(params.shadow_lights),
-							  static_cast<float>(params.shadow_resolution)};
+							  static_cast<float>(params.shadow_resolution),
+							  static_cast<float>(params.rounded),
+							  static_cast<float>(params.roof_seams)};
 	const bool  lights_changed
-			= lit_active && (light_hash != lit_hash || !std::equal(sliders, sliders + 9, lit_sliders));
+			= lit_active && (light_hash != lit_hash || !std::equal(sliders, sliders + 11, lit_sliders));
 	// A change of the occlusion grid (a door opened) relights more than
 	// its own rectangle.
 	bool grid_changed = false;
@@ -2743,7 +2762,9 @@ bool Shaded_light::shadow_pass(
 			for (int y = lr.y; y < lr.y + lr.h; y++) {
 				const int idx = buffers.index(lr.x, y);
 				for (int k = idx; k < idx + lr.w; k++) {
-					hash = (hash ^ (static_cast<uint64_t>(buffers.height_map[k]) | static_cast<uint64_t>(buffers.object_ids[k]) << 16))
+					hash = (hash
+							^ (static_cast<uint64_t>(buffers.height_map[k]) | static_cast<uint64_t>(buffers.object_ids[k]) << 16
+							   | static_cast<uint64_t>(buffers.normal_map[k]) << 32))
 						   * 1099511628211ull;
 				}
 			}
@@ -2752,7 +2773,8 @@ bool Shaded_light::shadow_pass(
 								   params.scroll_px, params.scroll_py, res, params.shadow_lights, params.shadow_steps,
 								   q16(params.shadow_softness * 256.0f), q16(params.shadow_bias * 256.0f),
 								   q16(params.facing_min * 256.0f), q16(params.area_height), set.screen, set.ray_grid,
-								   ray ? generation : 0, ray ? vol->origin_tx : 0, ray ? vol->origin_ty : 0});
+								   ray ? generation : 0, ray ? vol->origin_tx : 0, ray ? vol->origin_ty : 0, params.rounded,
+								   params.roof_seams});
 		}
 		const auto hit = use_cache ? map_cache.find(key) : map_cache.end();
 		if (hit != map_cache.end() && hit->second.map.x <= m.x && hit->second.map.y <= m.y
@@ -2947,7 +2969,7 @@ void Shaded_light::check_shadows(const Shaded_rect& r) {
 			return;
 		}
 		const Shaded_point  p   = Pixel_world(buffers, params, x, y);
-		const Shaded_normal n   = Shaded_face_normal(face);
+		const Shaded_normalf n  = Shaded_pixel_normal(buffers, idx, face);
 		const int           id  = buffers.object_ids[idx];
 		const int           bin = std::clamp(y / params.bin_size, 0, params.bins_y - 1) * params.bins_x
 						+ std::clamp(x / params.bin_size, 0, params.bins_x - 1);
@@ -3065,6 +3087,8 @@ void Shaded_light::finish_paint(Image_window8& win, bool full) {
 			lit_sliders[6] = params.shadow_softness;
 			lit_sliders[7] = static_cast<float>(params.shadow_lights);
 			lit_sliders[8] = static_cast<float>(params.shadow_resolution);
+			lit_sliders[9] = static_cast<float>(params.rounded);
+			lit_sliders[10] = static_cast<float>(params.roof_seams);
 			lit_grid       = Shaded_grid::active ? Shaded_grid::active->get_params().generation : -1;
 		}
 		if (timing) {
@@ -3176,7 +3200,7 @@ void Shaded_light::begin_object(const Game_object& obj, int ox, int oy) {
 	const Shaded_object_record rec{
 			t.tx, t.ty, t.tz, info.get_3d_xtiles(frame), info.get_3d_ytiles(frame), info.get_3d_height(), obj.get_shapenum(), frame};
 	const Shaded_volume volume  = volume_for(obj);
-	const uint8_t       opacity = Screen_opacity(obj, info, frame);
+	const uint8_t       opacity = Screen_opacity(obj, info, frame, volume);
 	const uint8_t       flags   = volume != Shaded_volume::box ? shaded_object_rounded : 0;
 	auto [it, inserted]         = object_index.try_emplace(&obj, shaded_id_overflow);
 	if (inserted && buffers.objects.size() < shaded_id_overflow - 1) {
