@@ -1560,6 +1560,8 @@ void Shaded_cpu::light_rows(
 														 && static_cast<size_t>(weather->flash_map) < weather->flash.maps.size()
 												 ? &weather->flash.maps[static_cast<size_t>(weather->flash_map)]
 												 : nullptr;
+	// Rain and snow painted over the frame (1 per marked pixel).
+	const uint8_t* particles = weather && params.precipitation ? weather->particles : nullptr;
 	float flash_l[3] = {params.flash_x, params.flash_y, params.flash_z * params.tiles_per_lift};
 	if (const float len = std::sqrt(flash_l[0] * flash_l[0] + flash_l[1] * flash_l[1] + flash_l[2] * flash_l[2]); len > 0.0f) {
 		for (float& c : flash_l) {
@@ -1745,6 +1747,19 @@ void Shaded_cpu::light_rows(
 				}
 			} else if (flash_out) {
 				flash_out[idx] = 0;
+			}
+			if (particles && particles[idx] && o > 0.0f) {
+				// A drop or flake in the open takes the light where it is:
+				// the sky and the lamps' light without the surface's facing
+				// or shadows, and the flash as far as its shadows let it.
+				const float scatter   = scatter_sum(bin, id, px, py, wz);
+				float       scattered = ambient_p + (1.0f - ambient_p) * (1.0f - std::exp(-scatter * params.brightness * inv_soft));
+				if (flash_map) {
+					const float t = shadow_screen_at(buf, weather->flash, *flash_map, x, y, buf.height_map[idx]);
+					const float f = std::min(params.flash * t, 1.0f);
+					scattered += f < 1.0f / 32.0f ? 0.0f : (1.0f - scattered) * f;
+				}
+				level = Shaded_particle_level(level, scattered, o);
 			}
 			levels[idx] = quantise(level, x, y);
 			if (fog_out) {
@@ -2698,8 +2713,10 @@ bool Shaded_light::prepare_weather() {
 	params.flash_x    = flash ? flash_dir[0] : 0.0f;
 	params.flash_y    = flash ? flash_dir[1] : 0.0f;
 	params.flash_z    = flash ? flash_dir[2] : 0.0f;
-	params.weather_active
-			= weather_wanted() && (!set.clouds.empty() || params.overcast > 0.0f || params.fog || flash) ? 1 : 0;
+	// Rain and snow are relit as they are painted.
+	const bool particles = params.precipitation && (in.rain || in.snow);
+	const bool terms      = !set.clouds.empty() || params.overcast > 0.0f || params.fog || flash || particles;
+	params.weather_active = weather_wanted() && terms ? 1 : 0;
 	return changed || fog_moved || (lit_active && cloud_hash != lit_cloud_hash);
 }
 
@@ -2745,6 +2762,8 @@ void Shaded_light::prepare_weather_pass() {
 		set.open_h  = 0;
 		open_generation = -1;
 	}
+	// The drops and flakes painted this paint.
+	set.particles  = params.precipitation ? buffers.particle_mask.data() : nullptr;
 	weather_set_on = true;
 }
 
@@ -2799,6 +2818,29 @@ void Shaded_light::end_flash() {
 	flash_end_pending = false;
 	need_full         = true;
 	Game_window::get_instance()->set_all_dirty();
+}
+
+/*
+ *  Rain_effect's drops of a recorded paint, between end_paint and
+ *  finish_paint: mark their pixels while weather lighting relights them.
+ */
+
+void Shaded_light::begin_particles(bool lamp_lit) {
+	Image_window8* win = Game_window::get_instance()->get_win();
+	if (!lamp_lit || !weather_wanted() || !params.precipitation || !lit_active || !params.weather_active || !win
+		|| !recorded || win->get_ib8() != recorded || buffers.particle_mask.size() != buffers.height_map.size()) {
+		return;
+	}
+	in_particles = true;
+	Shape_manager::get_instance()->set_paint_listener(this);
+}
+
+void Shaded_light::end_particles() {
+	if (!in_particles) {
+		return;
+	}
+	Shape_manager::get_instance()->set_paint_listener(nullptr);
+	in_particles = false;
 }
 
 /*
@@ -3169,6 +3211,9 @@ void Shaded_light::begin_paint(Image_window8& win, bool full) {
 	case Shaded_backend::gpu:    // backend() falls back to CPU.
 	case Shaded_backend::cpu:
 		Shaded_cpu::clear_rect(buffers, clip);
+		for (int y = clip.y; y < clip.y + clip.h; y++) {
+			std::fill_n(buffers.particle_mask.begin() + buffers.index(clip.x, y), clip.w, 0);
+		}
 		break;
 	}
 	target = ib;
@@ -3252,6 +3297,7 @@ void Shaded_light::end_paint(Image_window8& win, bool full) {
 	}
 	const Clock::time_point stop = Clock::now();
 	const bool              was_active = active == this;
+	recorded                           = was_active ? target : nullptr;    // For the drops.
 	active                             = nullptr;
 	target                             = nullptr;
 	if (in_object) {
@@ -3794,10 +3840,15 @@ void Shaded_light::check_weather(const Shaded_rect& r) {
 	long   flash_lit = 0, flash_shadowed = 0, flash_covered = 0;    // Faces turned to the flash.
 	double sky_sum = 0;
 	const float flash_l[3] = {params.flash_x, params.flash_y, params.flash_z * params.tiles_per_lift};
+	long particles = 0, relit = 0;    // Drop and flake pixels, and those lit apart.
 	for (int y = r.y; y < r.y + r.h; y++) {
 		const int idx = buffers.index(r.x, y);
 		for (int i = idx; i < idx + r.w; i++) {
 			fogged += buffers.fog_codes[i] != 0 ? 1 : 0;
+			if (buffers.particle_mask[i] != 0) {
+				particles++;
+				relit += plain[i] != buffers.light_levels[i] ? 1 : 0;
+			}
 			const uint8_t face = buffers.facing_map[i] & shaded_face_mask;
 			if (face == shaded_face_none) {
 				continue;
@@ -3833,6 +3884,8 @@ void Shaded_light::check_weather(const Shaded_rect& r) {
 			<< " lit px " << flash_lit << " shadowed px " << flash_shadowed << " (lit under cover " << flash_covered
 			<< ") traces " << flash_traces << " flash_us " << flash_pass_us << "\n";
 	}
+	out << "weather precipitation " << (in.rain ? "rain" : in.snow ? "snow" : "none") << " ("
+		<< (params.precipitation ? "on" : "off") << ") particle px " << particles << " relit " << relit << "\n";
 	out << "weather outdoor mean sky " << (outdoor > 0 ? sky_sum / static_cast<double>(outdoor) : 0.0) << "\n"
 		<< "check weather indoor violations " << violations << " (outdoor px " << outdoor << ", covered px " << covered
 		<< ")\n";
@@ -3840,6 +3893,7 @@ void Shaded_light::check_weather(const Shaded_rect& r) {
 }
 
 void Shaded_light::finish_paint(Image_window8& win, bool full) {
+	recorded = nullptr;
 	if (!finish_due) {
 		return;
 	}
@@ -4171,6 +4225,18 @@ const Shaded_silhouette& Shaded_light::silhouette_for(Shape_frame& shape, int xo
 }
 
 void Shaded_light::shape_painted(int xoff, int yoff, Shape_frame& shape, bool translucent, int xfcnt) {
+	if (in_particles) {
+		// A rain drop or snowflake: only where it is, not what it is.
+		if (shape.is_rle() && Game_window::get_instance()->get_win()->get_ib8() == recorded) {
+			switch (backend()) {
+			case Shaded_backend::gpu:    // backend() falls back to CPU.
+			case Shaded_backend::cpu:
+				Shaded_cpu::mark_spans(buffers, clip, shape.get_data(), xoff, yoff);
+				break;
+			}
+		}
+		return;
+	}
 	// Only shapes painted for the current world object, into the frame.
 	if (!in_object || active != this || Game_window::get_instance()->get_win()->get_ib8() != target) {
 		return;

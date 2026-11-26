@@ -58,6 +58,8 @@
 #	pragma GCC diagnostic pop
 #endif    // __GNUC__
 
+#include <type_traits>
+
 using namespace Pentagram;
 
 using std::rand;
@@ -1585,6 +1587,18 @@ public:
 		return false;
 	}
 
+	// Rain and snow take the lamps' light in shaded light; sparkles glow
+	// by themselves.
+	static constexpr bool lamp_lit = std::is_same_v<Functor, Raindrop> || std::is_same_v<Functor, Snowflake>;
+
+	void add_shaded_weather(Shaded_weather_input& in) const override {
+		if constexpr (std::is_same_v<Functor, Raindrop>) {
+			in.rain = true;
+		} else if constexpr (std::is_same_v<Functor, Snowflake>) {
+			in.snow = true;
+		}
+	}
+
 	// Execute when due.
 	void handle_event(
 			unsigned long curtime,    // Current time of day.
@@ -1626,9 +1640,12 @@ public:
 		Image_window8* win      = gwin->get_win();
 		const int      w        = win->get_game_width();
 		const int      h        = win->get_game_height();
+		Shaded_light&  shaded   = Shaded_light::get();
+		shaded.begin_particles(lamp_lit);
 		for (int i = 0; i < num_drops; i++) {
 			do_drop.paint(drops[i], scrolltx, scrollty, w, h);
 		}
+		shaded.end_particles();
 		gwin->set_painted();
 	}
 };

@@ -1041,6 +1041,12 @@ public:
 	// must show the LIGHTNING palette as before.  A flash is shown on at
 	// least one painted frame, however soon it ends.
 	bool lightning(bool on);
+	// Around Rain_effect's drops (lamp_lit: rain or snow, not sparkles):
+	// while weather lighting relights precipitation in this paint, the
+	// pixels they paint are marked, so the light pass gives them the light
+	// at their screen position instead of their surface's.
+	void begin_particles(bool lamp_lit);
+	void end_particles();
 
 	// Palettes lighting works over: DUSK/DAWN, NIGHT and SPELL, and with
 	// weather lighting OVERCAST, and DAY while there is weather.
@@ -1104,8 +1110,10 @@ private:
 	Image_buffer8*        target = nullptr;    // Buffer painted into.
 	Shaded_rect           clip;                // Paint clip, within bounds.
 	Shaded_object_context object;
-	bool                  in_object = false;
-	bool                  record_on = false;    // Config or dump.
+	bool                  in_object    = false;
+	bool                  in_particles = false;      // Marking rain or snow.
+	Image_buffer8*        recorded     = nullptr;    // Recorded paint, until finish_paint.
+	bool                  record_on    = false;      // Config or dump.
 	std::unordered_map<const Game_object*, uint16_t> object_index;
 	uint16_t                                         main_actor_id = shaded_id_none;
 	bool                                             finish_due    = false;    // Recorded, finish_paint not run.
