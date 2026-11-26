@@ -39,6 +39,7 @@
 #include "ignore_unused_variable_warning.h"
 #include "objiter.h"
 #include "perf.h"
+#include "shadedlight.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -359,7 +360,10 @@ void Game_window::paint(
 	int light_sources = 0;
 
 	if (main_actor) {
+		const bool full = !gx && !gy && gw == get_width() && gh == get_height();
+		Shaded_light::get().begin_paint(*win, full);
 		light_sources = render->paint_map(gx, gy, gw, gh);
+		Shaded_light::get().end_paint(*win, full);
 	} else {
 		win->fill8(0);
 	}
@@ -527,6 +531,9 @@ void Game_render::paint_chunk_flats(
 	Image_buffer8* cflats = olist->get_rendered_flats();
 	if (cflats) {
 		gwin->win->copy8(cflats->get_bits(), c_chunksize, c_chunksize, xoff, yoff);
+		if (Shaded_light* const shaded = Shaded_light::recording()) {
+			shaded->record_plane(xoff, yoff, c_chunksize, c_chunksize, 0, shaded_face_ground);
+		}
 	}
 }
 
@@ -544,7 +551,16 @@ void Game_render::paint_chunk_flat_rles(
 	Flat_object_iterator next(olist);    // Do flat RLE objects.
 	Game_object*         obj;
 	while ((obj = next.get_next()) != nullptr) {
+		Shaded_light* const shaded = Shaded_light::recording();
+		if (shaded) {
+			int x, y;
+			gwin->get_shape_location(obj, x, y);
+			shaded->begin_object(*obj, x, y);
+		}
 		obj->paint();
+		if (shaded) {
+			shaded->end_object();
+		}
 	}
 }
 
@@ -609,7 +625,14 @@ void Game_render::paint_object(Game_object* obj) {
 		obj->get_info().paint_bbox(
 				bbox_x, bbox_y, obj->get_framenum(), Game_window::get_instance()->get_win()->get_ib8(), bbox_palindex, 2);
 	}
+	Shaded_light* const shaded = Shaded_light::recording();
+	if (shaded) {
+		shaded->begin_object(*obj, bbox_x, bbox_y);
+	}
 	obj->paint();    // Finally, paint this one.
+	if (shaded) {
+		shaded->end_object();
+	}
 	// paint bbox front
 	if (bbox_palindex != -1) {
 		obj->get_info().paint_bbox(
@@ -649,6 +672,9 @@ void Game_render::paint_blackness(int start_chunkx, int start_chunky, int stop_c
 	Game_window* gwin = Game_window::get_instance();
 	// Calculate the offset due to the lift (4x the lift).
 	const int off = gwin->in_dungeon << 2;
+	// The blackness is a roof at the dungeon's lift in the scene record.
+	Shaded_light* const shaded = Shaded_light::recording();
+	const int           roof   = static_cast<int>(gwin->in_dungeon);
 
 	// For each chunk that might be renderable
 	for (int cy = start_chunky; cy != stop_chunky; cy = INCR_CHUNK(cy)) {
@@ -662,6 +688,9 @@ void Game_render::paint_blackness(int start_chunkx, int start_chunky, int stop_c
 			Map_chunk* mc = gwin->map->get_chunk(cx, cy);
 			if (!mc->has_dungeon()) {
 				gwin->win->fill8(index, c_tilesize * c_tiles_per_chunk, c_tilesize * c_tiles_per_chunk, xoff, y);
+				if (shaded) {
+					shaded->record_plane(xoff, y, c_chunksize, c_chunksize, roof, shaded_face_top);
+				}
 				continue;
 			}
 			// For each line in the chunk
@@ -681,6 +710,9 @@ void Game_render::paint_blackness(int start_chunkx, int start_chunky, int stop_c
 					else if (w) {
 						// Draw blackness
 						gwin->win->fill8(index, w, c_tilesize, x, y);
+						if (shaded) {
+							shaded->record_plane(x, y, w, c_tilesize, roof, shaded_face_top);
+						}
 
 						// Set the start of the area to the next tile
 						x += w + c_tilesize;
@@ -698,6 +730,9 @@ void Game_render::paint_blackness(int start_chunkx, int start_chunky, int stop_c
 				// If we have an area, paint it.
 				if (w) {
 					gwin->win->fill8(index, w, c_tilesize, x, y);
+					if (shaded) {
+						shaded->record_plane(x, y, w, c_tilesize, roof, shaded_face_top);
+					}
 				}
 
 				// Increment the y coord for the next line
