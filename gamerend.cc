@@ -366,18 +366,21 @@ void Game_window::paint(
 	}
 	win->set_clip(gx, gy, gw, gh);    // Clip to this area.
 
-	int light_sources = 0;
+	int        light_sources = 0;
+	const bool full_paint    = !gx && !gy && gw == get_width() && gh == get_height();
 
 	if (main_actor) {
-		const bool full = !gx && !gy && gw == get_width() && gh == get_height();
-		Shaded_light::get().begin_paint(*win, full);
+		Shaded_light::get().begin_paint(*win, full_paint);
 		light_sources = render->paint_map(gx, gy, gw, gh);
-		Shaded_light::get().end_paint(*win, full);
+		Shaded_light::get().end_paint(*win, full_paint);
 	} else {
 		win->fill8(0);
 	}
 
 	effects->paint();    // Draw sprites.
+	if (main_actor) {
+		Shaded_light::get().finish_paint(*win, full_paint);
+	}
 
 	win->set_clip(x, y, w, h);    // Clip to this area.
 	// Fill black into unpainted regions

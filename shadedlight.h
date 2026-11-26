@@ -40,6 +40,7 @@
 #include <chrono>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <string>
 #include <type_traits>
 #include <unordered_map>
@@ -72,8 +73,13 @@ enum class Shaded_view : int32_t {
 	height,
 	facing,
 	object_id,
+	light,    // Light level as a grey ramp.
+	unlit,    // The frame without the light pass.
 	count
 };
+
+// Light levels: 0 = black .. shaded_light_levels - 1 = full light.
+constexpr int shaded_light_levels = 32;
 
 enum class Shaded_backend : int32_t {
 	cpu = 0,
@@ -109,11 +115,25 @@ struct alignas(16) Shaded_light_params {
 	float   pixels_per_lift       = 4.0f;
 	float   height_units_per_lift = static_cast<float>(shaded_height_units_per_lift);
 	float   debug_height_range    = 16.0f;    // Lifts covered by the height ramp.
-	// Global sliders for stage 2 (unused so far).
+	// Global sliders (config/video/shaded_light/...), as fractions.
 	float ambient      = 1.0f;
 	float brightness   = 1.0f;
 	float radius_scale = 1.0f;
-	float reserved0    = 0.0f;
+	float softness     = 1.0f;
+	// Light pass.
+	int32_t light_count = 0;
+	int32_t level_count = shaded_light_levels;
+	int32_t dither      = 1;    // 4x4 ordered dither on the level.
+	int32_t lit         = 0;    // Lighting active (set by the palette step).
+	float   ambient_level  = 0.3f;    // Level of unlit surfaces, 0..1.
+	float   facing_min     = 0.5f;    // Facing term for light at a grazing angle.
+	float   tiles_per_lift = 0.5f;    // Lift height in tiles, for 3D distance.
+	float   area_height    = 6.0f;    // Lifts above an area light it reaches.
+	// Screen-space light bins over the game area.
+	int32_t bin_size = 16;    // Pixels per side.
+	int32_t bins_x   = 0;
+	int32_t bins_y   = 0;
+	int32_t threads  = 0;    // Threads of the light pass (0 = auto until set up).
 };
 
 static_assert(sizeof(Shaded_light_params) % 16 == 0);
@@ -200,7 +220,12 @@ struct Shaded_scene_buffers {
 	std::vector<uint16_t>             height_map;    // 1/16 lift above lift 0.
 	std::vector<uint8_t>              facing_map;    // shaded_face_* (+ clamped bit).
 	std::vector<uint16_t>             object_ids;    // shaded_id_*.
+	std::vector<uint8_t>              light_levels;    // 0..level_count - 1.
 	std::vector<Shaded_object_record> objects;
+	// Light bins: the lights reaching bin b are
+	// bin_lights[bin_offsets[b] .. bin_offsets[b + 1]).
+	std::vector<uint32_t> bin_offsets;
+	std::vector<uint16_t> bin_lights;
 	// Game-area rectangle the buffers cover.
 	Shaded_rect bounds() const;
 
@@ -251,6 +276,50 @@ constexpr Shaded_box_hit Shaded_classify_box(int u, int v, int xpx, int ypx, int
 }
 
 /*
+ *  Light falloff over t = d^2 / R^2: 1 at the light, 0 from the radius on.
+ */
+constexpr float Shaded_falloff(float t) {
+	if (t >= 1.0f) {
+		return 0.0f;
+	}
+	const float u = 1.0f - t;
+	return u * u;
+}
+
+/*
+ *  4x4 ordered dither threshold in (0, 1) for a world pixel.
+ */
+constexpr float Shaded_bayer4(int x, int y) {
+	constexpr int order[16] = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5};
+	return (static_cast<float>(order[((y & 3) << 2) | (x & 3)]) + 0.5f) / 16.0f;
+}
+
+/*
+ *  Surface normal of a face, in world axes (x east, y south, z up).  Tops,
+ *  ground and rounded surfaces face up.
+ */
+struct Shaded_normal {
+	int x, y, z;
+};
+
+constexpr Shaded_normal Shaded_face_normal(uint8_t facing) {
+	switch (facing & shaded_face_mask) {
+	case shaded_face_south:
+		return Shaded_normal{0, 1, 0};
+	case shaded_face_east:
+		return Shaded_normal{1, 0, 0};
+	default:
+		return Shaded_normal{0, 0, 1};
+	}
+}
+
+// Whether a face can see a light at (dx, dy, dz) from it.
+constexpr bool Shaded_faces_light(uint8_t facing, float dx, float dy, float dz) {
+	const Shaded_normal n = Shaded_face_normal(facing);
+	return static_cast<float>(n.x) * dx + static_cast<float>(n.y) * dy + static_cast<float>(n.z) * dz > 0.0f;
+}
+
+/*
  *  What the per-pixel steps need to know about the object being painted.
  */
 struct Shaded_object_context {
@@ -282,7 +351,20 @@ namespace Shaded_cpu {
 			unsigned char* frame);
 	// False colour code (index into the lut) for one pixel of a view.
 	int view_code(const Shaded_scene_buffers& buf, const Shaded_light_params& params, int index);
+	// Sort the lights into params.bins_x x params.bins_y screen bins, each
+	// light into every bin its reach may cover.
+	void build_bins(
+			const Shaded_light_params& params, const std::vector<Shaded_light_record>& lights,
+			std::vector<uint32_t>& offsets, std::vector<uint16_t>& list);
+	// Light level of every pixel of rows [y0, y1) of r into levels (indexed
+	// like the buffers).  Bins as from build_bins.
+	void light_rows(
+			const Shaded_scene_buffers& buf, const Shaded_light_params& params, const Shaded_light_record* lights,
+			const uint32_t* bin_offsets, const uint16_t* bin_lights, const Shaded_rect& r, int y0, int y1,
+			uint8_t* levels);
 }    // namespace Shaded_cpu
+
+class Shaded_workers;
 
 // Which volume an object uses.  Box for everything in stage 1; people,
 // trees and other organic shapes become rounded in a later stage.
@@ -316,6 +398,8 @@ public:
 	// Around Game_render::paint_map in Game_window::paint.
 	void begin_paint(Image_window8& win, bool full);
 	void end_paint(Image_window8& win, bool full);
+	// After the sprite effects: the light pass, debug views and dumps.
+	void finish_paint(Image_window8& win, bool full);
 	// Around obj->paint() for a world object (ox, oy = its shape location).
 	void begin_object(const Game_object& obj, int ox, int oy);
 	void end_object();
@@ -355,12 +439,12 @@ private:
 	bool                  record_on = false;    // Config or dump.
 	std::unordered_map<const Game_object*, uint16_t> object_index;
 	uint16_t                                         main_actor_id = shaded_id_none;
-	// Config (config/video/shaded_light/...); sliders as fractions.
-	bool  lighting_on  = false;
-	float cfg_softness = 1.0f;
-	float cfg_facing   = 0.5f;
-	bool  cfg_dither   = true;
-	int   cfg_threads  = 0;    // 0 = auto.
+	bool                                             finish_due    = false;    // Recorded, finish_paint not run.
+	// Config (config/video/shaded_light/...); sliders in params.
+	bool lighting_on = false;
+	// Light pass workers (params.threads - 1 of them, made when needed).
+	std::unique_ptr<Shaded_workers> workers;
+	std::string                     thread_check;    // For the dump info.
 	// The light table (shaded_light.txt), keyed by (shape, frame or -1).
 	std::map<std::pair<int, int>, Shaded_light_entry> light_table;
 	std::string                                       table_game;    // Game and mod it was read for.
@@ -395,6 +479,10 @@ private:
 	double            paint_pixels    = 0;    // Total clip area.
 	double            all_paint_us    = 0;
 	double            all_record_us   = 0;
+	long long         light_passes    = 0;    // Light pass, all and full paints.
+	long long         full_light_passes = 0;
+	double            all_light_us    = 0;
+	double            full_light_us   = 0;
 	Clock::time_point last_report;
 	int               game_width      = 0;    // Of the last full paint.
 	int               game_height     = 0;
@@ -412,6 +500,7 @@ private:
 						  const Game_object& source, const Game_object& owner, const Shaded_light_entry& entry,
 						  Shaded_light_row row, bool carried);
 	void               shift(int dx, int dy);
+	int                light_pass(const Shaded_rect& r, uint8_t* levels, bool threaded);
 	void           build_lut(uint8_t* lut) const;
 	void           dump(Image_window8& win, int number, bool view, bool full);
 	void           report_timing() const;

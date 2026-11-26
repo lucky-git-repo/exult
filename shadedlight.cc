@@ -46,13 +46,17 @@
 
 #include <algorithm>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
+#include <mutex>
 #include <sstream>
+#include <thread>
 
 #ifdef HAVE_PNG_H
 #	include <png.h>
@@ -80,6 +84,115 @@ static_assert(Shaded_classify_box(-10, -6, 8, 16, 16).dz_px == Shaded_classify_b
 static_assert(Shaded_default_light(1).radius == 4 && Shaded_default_light(1).brightness == 60);
 static_assert(Shaded_default_light(5).radius == 8 && Shaded_default_light(5).brightness == 100);
 static_assert(Shaded_default_light(7).radius == 10 && Shaded_default_light(7).brightness == 120);
+// Falloff: full at the light, a quarter half way out (in d^2), none past R.
+static_assert(Shaded_falloff(0.0f) == 1.0f);
+static_assert(Shaded_falloff(0.5f) == 0.25f);
+static_assert(Shaded_falloff(1.0f) == 0.0f && Shaded_falloff(2.0f) == 0.0f);
+// Dither thresholds: inside (0, 1), repeating every 4 pixels.
+static_assert(Shaded_bayer4(0, 0) == 0.5f / 16.0f && Shaded_bayer4(3, 3) == 5.5f / 16.0f);
+static_assert(Shaded_bayer4(0, 3) == 15.5f / 16.0f && Shaded_bayer4(4, -4) == Shaded_bayer4(0, 0));
+// Facing: a south face sees lights to its south, an east face lights to
+// its east, and tops and ground only lights above them.
+static_assert(Shaded_faces_light(shaded_face_south, 0.0f, 2.0f, 0.0f));
+static_assert(!Shaded_faces_light(shaded_face_south, 0.0f, -2.0f, 0.0f));
+static_assert(Shaded_faces_light(shaded_face_east, 2.0f, 0.0f, 0.0f));
+static_assert(!Shaded_faces_light(shaded_face_east, -2.0f, 0.0f, 0.0f));
+static_assert(Shaded_faces_light(shaded_face_top, 1.0f, 1.0f, 0.5f));
+static_assert(!Shaded_faces_light(shaded_face_top, 1.0f, 1.0f, -0.5f));
+static_assert(!Shaded_faces_light(shaded_face_ground | shaded_face_clamped, 0.0f, 0.0f, -1.0f));
+
+/*
+ *  A small persistent thread pool for the light pass.  run() hands bands
+ *  out to the workers and the calling thread, and returns when all are
+ *  done.
+ */
+class Shaded_workers {
+public:
+	explicit Shaded_workers(int threads) {
+		for (int i = 1; i < threads; i++) {
+			workers.emplace_back([this]() {
+				work();
+			});
+		}
+	}
+
+	~Shaded_workers() {
+		{
+			const std::lock_guard<std::mutex> lock(mutex);
+			stop = true;
+		}
+		wake.notify_all();
+		for (auto& worker : workers) {
+			worker.join();
+		}
+	}
+
+	Shaded_workers(const Shaded_workers&)            = delete;
+	Shaded_workers& operator=(const Shaded_workers&) = delete;
+
+	int size() const {
+		return static_cast<int>(workers.size()) + 1;
+	}
+
+	void run(int bands, const std::function<void(int)>& job) {
+		{
+			const std::lock_guard<std::mutex> lock(mutex);
+			current    = &job;
+			band_count = bands;
+			next_band  = 0;
+			remaining  = bands;
+			generation++;
+		}
+		wake.notify_all();
+		std::unique_lock<std::mutex> lock(mutex);
+		take_bands(lock);
+		done.wait(lock, [this]() {
+			return remaining == 0;
+		});
+		current = nullptr;
+	}
+
+private:
+	std::vector<std::thread>          workers;
+	std::mutex                        mutex;
+	std::condition_variable           wake;
+	std::condition_variable           done;
+	const std::function<void(int)>*   current    = nullptr;
+	int                               band_count = 0;
+	int                               next_band  = 0;
+	int                               remaining  = 0;
+	uint64_t                          generation = 0;
+	bool                              stop       = false;
+
+	// Run bands until none are left; the lock is held on entry and exit.
+	void take_bands(std::unique_lock<std::mutex>& lock) {
+		while (next_band < band_count) {
+			const int                       band = next_band++;
+			const std::function<void(int)>* job  = current;
+			lock.unlock();
+			(*job)(band);
+			lock.lock();
+			if (--remaining == 0) {
+				done.notify_all();
+			}
+		}
+	}
+
+	void work() {
+		uint64_t                     seen = 0;
+		std::unique_lock<std::mutex> lock(mutex);
+		while (true) {
+			wake.wait(lock, [this, seen]() {
+				return stop || generation != seen;
+			});
+			if (stop) {
+				return;
+			}
+			seen = generation;
+			take_bands(lock);
+		}
+	}
+};
 
 namespace {
 	constexpr int lut_size = 64;    // False colour codes per view.
@@ -378,11 +491,178 @@ int Shaded_cpu::view_code(const Shaded_scene_buffers& buf, const Shaded_light_pa
 		}
 		return 1 + static_cast<int>((id * 2654435761u >> 16) % (lut_size - 1));
 	}
+	case Shaded_view::light:
+		return 1 + buf.light_levels[index] * (lut_size - 2) / std::max(params.level_count - 1, 1);
 	case Shaded_view::normal:
+	case Shaded_view::unlit:
 	case Shaded_view::count:
 		break;
 	}
 	return 0;
+}
+
+void Shaded_cpu::build_bins(
+		const Shaded_light_params& params, const std::vector<Shaded_light_record>& lights, std::vector<uint32_t>& offsets,
+		std::vector<uint16_t>& list) {
+	const int cells = std::max(params.bins_x, 0) * std::max(params.bins_y, 0);
+	offsets.assign(static_cast<size_t>(cells) + 1, 0);
+	list.clear();
+	if (cells <= 0) {
+		return;
+	}
+	// Bins each light covers: x0, y0, x1, y1 inclusive (x1 < x0: none).
+	struct Span {
+		int x0, y0, x1, y1;
+	};
+
+	std::vector<Span> spans(lights.size(), Span{0, 0, -1, -1});
+	const auto        tiles = static_cast<float>(c_num_tiles);
+	const auto        size  = static_cast<float>(params.bin_size);
+	auto              wrap  = [tiles](float d) {
+		d = std::fmod(d, tiles);
+		if (d > tiles * 0.5f) {
+			d -= tiles;
+		} else if (d < -tiles * 0.5f) {
+			d += tiles;
+		}
+		return d;
+	};
+	// Pixel range covered by world x (or y) in [lo, hi] tiles from the
+	// scroll tile, at heights zlo..zhi lifts: px = 8 * w - scroll_px - 0.5 - 4 * z.
+	auto cover = [&](float lo, float hi, int scroll_px, float zlo, float zhi, int count, int& c0, int& c1) {
+		const float p0 = lo * params.pixels_per_tile - static_cast<float>(scroll_px) - 0.5f - zhi * params.pixels_per_lift;
+		const float p1 = hi * params.pixels_per_tile - static_cast<float>(scroll_px) - 0.5f - zlo * params.pixels_per_lift;
+		c0             = std::max(static_cast<int>(std::floor(p0 / size)), 0);
+		c1             = std::min(static_cast<int>(std::floor(p1 / size)), count - 1);
+	};
+	for (size_t i = 0; i < lights.size(); i++) {
+		const Shaded_light_record& l = lights[i];
+		const float                r = l.radius * params.radius_scale;
+		if (r <= 0.0f || (l.flags & shaded_light_off)) {
+			continue;
+		}
+		// Heights the light can reach: within R in 3D, or the area band.
+		float zlo, zhi;
+		if (l.flags & shaded_light_area) {
+			zlo = l.z - 1.0f;
+			zhi = l.z + params.area_height;
+		} else {
+			zlo = l.z - r / params.tiles_per_lift;
+			zhi = l.z + r / params.tiles_per_lift;
+		}
+		zlo               = std::max(zlo, 0.0f);
+		zhi               = std::max(zhi, zlo);
+		const float dx    = wrap(l.x - static_cast<float>(params.scroll_tx));
+		const float dy    = wrap(l.y - static_cast<float>(params.scroll_ty));
+		Span&       span  = spans[i];
+		cover(dx - r, dx + r, params.scroll_px, zlo, zhi, params.bins_x, span.x0, span.x1);
+		cover(dy - r, dy + r, params.scroll_py, zlo, zhi, params.bins_y, span.y0, span.y1);
+		for (int y = span.y0; y <= span.y1; y++) {
+			for (int x = span.x0; x <= span.x1; x++) {
+				offsets[static_cast<size_t>(y * params.bins_x + x) + 1]++;
+			}
+		}
+	}
+	for (int c = 0; c < cells; c++) {
+		offsets[static_cast<size_t>(c) + 1] += offsets[static_cast<size_t>(c)];
+	}
+	list.resize(offsets[static_cast<size_t>(cells)]);
+	std::vector<uint32_t> fill(offsets.begin(), offsets.end() - 1);
+	for (size_t i = 0; i < lights.size(); i++) {
+		const Span& span = spans[i];
+		for (int y = span.y0; y <= span.y1; y++) {
+			for (int x = span.x0; x <= span.x1; x++) {
+				list[fill[static_cast<size_t>(y * params.bins_x + x)]++] = static_cast<uint16_t>(i);
+			}
+		}
+	}
+}
+
+void Shaded_cpu::light_rows(
+		const Shaded_scene_buffers& buf, const Shaded_light_params& params, const Shaded_light_record* lights,
+		const uint32_t* bin_offsets, const uint16_t* bin_lights, const Shaded_rect& r, int y0, int y1, uint8_t* levels) {
+	if (params.bins_x <= 0 || params.bins_y <= 0) {
+		return;
+	}
+	const int   top_level = std::max(params.level_count - 1, 1);
+	const auto  tiles     = static_cast<float>(c_num_tiles);
+	const float ambient   = params.ambient_level;
+	const float inv_tile  = 1.0f / params.pixels_per_tile;
+	const float inv_units = 1.0f / params.height_units_per_lift;
+	const float lift_tile = params.pixels_per_lift * inv_tile;    // Tiles per lift of screen shift.
+	const float inv_soft  = 1.0f / std::max(params.softness, 0.01f);
+	const float facing    = params.facing_min;
+	// Shortest way round the wrapped world.
+	auto wrap = [tiles](float d) {
+		if (d > tiles * 0.5f) {
+			d -= tiles;
+		} else if (d < -tiles * 0.5f) {
+			d += tiles;
+		}
+		return d;
+	};
+	// Level for light l, dithered against world pixels so it does not crawl.
+	auto quantise = [&](float l, int x, int y) {
+		const float threshold = params.dither ? Shaded_bayer4(x + params.scroll_px, y + params.scroll_py) : 0.5f;
+		const int   q         = static_cast<int>(std::floor(l * static_cast<float>(top_level) + threshold));
+		return static_cast<uint8_t>(std::clamp(q, 0, top_level));
+	};
+	for (int y = y0; y < y1; y++) {
+		const int   row    = buf.index(0, y);
+		const int   bin_y  = std::clamp(y / params.bin_size, 0, params.bins_y - 1);
+		const float base_x = static_cast<float>(params.scroll_tx) + static_cast<float>(r.x + params.scroll_px) * inv_tile + 0.5f * inv_tile;
+		const float base_y = static_cast<float>(params.scroll_ty) + (static_cast<float>(y + params.scroll_py) + 0.5f) * inv_tile;
+		for (int x = r.x; x < r.x + r.w; x++) {
+			const int     idx  = row + x;
+			const uint8_t face = buf.facing_map[idx] & shaded_face_mask;
+			if (face == shaded_face_none) {
+				levels[idx] = quantise(ambient, x, y);
+				continue;
+			}
+			// World position as in Shaded_light::world_position, unwrapped.
+			const float         wz   = static_cast<float>(buf.height_map[idx]) * inv_units;
+			const float         px   = base_x + static_cast<float>(x - r.x) * inv_tile + wz * lift_tile;
+			const float         py   = base_y + wz * lift_tile;
+			const Shaded_normal n    = Shaded_face_normal(face);
+			const int           id   = buf.object_ids[idx];
+			const int           bin  = bin_y * params.bins_x + std::clamp(x / params.bin_size, 0, params.bins_x - 1);
+			float               sum  = 0.0f;
+			for (uint32_t k = bin_offsets[bin]; k < bin_offsets[bin + 1]; k++) {
+				const Shaded_light_record& l = lights[bin_lights[k]];
+				if (id != shaded_id_none && l.object_id == id) {
+					sum += l.intensity;    // The light's own object.
+					continue;
+				}
+				const float radius = l.radius * params.radius_scale;
+				const float r2     = radius * radius;
+				const float dx     = wrap(l.x - px);
+				const float dy     = wrap(l.y - py);
+				const float h2     = dx * dx + dy * dy;
+				if (h2 >= r2) {
+					continue;
+				}
+				if (l.flags & shaded_light_area) {
+					if (wz >= l.z - 1.0f && wz <= l.z + params.area_height) {
+						sum += l.intensity * Shaded_falloff(h2 / r2);
+					}
+					continue;
+				}
+				const float dz = (l.z - wz) * params.tiles_per_lift;
+				const float d2 = h2 + dz * dz;
+				if (d2 >= r2) {
+					continue;
+				}
+				const float dot   = static_cast<float>(n.x) * dx + static_cast<float>(n.y) * dy + static_cast<float>(n.z) * dz;
+				const float ndotl = d2 > 1e-6f ? dot / std::sqrt(d2) : 1.0f;
+				if (ndotl <= 0.0f) {
+					continue;
+				}
+				sum += l.intensity * Shaded_falloff(d2 / r2) * (facing + (1.0f - facing) * ndotl);
+			}
+			const float level = ambient + (1.0f - ambient) * (1.0f - std::exp(-sum * params.brightness * inv_soft));
+			levels[idx]       = quantise(level, x, y);
+		}
+	}
 }
 
 void Shaded_cpu::resolve_view(
@@ -447,6 +727,16 @@ Shaded_light::Shaded_light() {
 				params.view = v;
 			}
 		}
+		if (std::string(view) == "lit") {    // The lit frame is the normal view.
+			params.view = static_cast<int32_t>(Shaded_view::normal);
+		}
+	}
+	// Light pass threads: config or EXULT_SHADED_THREADS, 0 = auto.
+	if (const char* thr = std::getenv("EXULT_SHADED_THREADS"); thr && *thr) {
+		params.threads = std::max(std::atoi(thr), 0);
+	}
+	if (params.threads <= 0) {
+		params.threads = std::clamp(static_cast<int>(std::thread::hardware_concurrency()), 1, 8);
 	}
 	const char* tim = std::getenv("EXULT_SHADED_TIMING");
 	timing          = tim && *tim && *tim != '0';
@@ -486,6 +776,10 @@ const char* Shaded_light::view_name(Shaded_view view) {
 		return "facing";
 	case Shaded_view::object_id:
 		return "id";
+	case Shaded_view::light:
+		return "light";
+	case Shaded_view::unlit:
+		return "unlit";
 	case Shaded_view::normal:
 	case Shaded_view::count:
 		break;
@@ -523,11 +817,14 @@ void Shaded_light::read_config() {
 	params.brightness   = percent("brightness", 100);
 	params.radius_scale = percent("radius", 100);
 	params.ambient      = percent("ambient", 100);
-	cfg_softness        = std::max(percent("softness", 100), 0.01f);
-	cfg_facing          = std::min(percent("facing", 50), 1.0f);
-	config->value(base + "dither", cfg_dither, true);
-	config->value(base + "threads", cfg_threads, 0);
-	cfg_threads = std::max(cfg_threads, 0);
+	params.softness     = std::max(percent("softness", 100), 0.01f);
+	params.facing_min   = std::min(percent("facing", 50), 1.0f);
+	bool dither;
+	config->value(base + "dither", dither, true);
+	params.dither = dither ? 1 : 0;
+	int threads;
+	config->value(base + "threads", threads, 0);
+	params.threads = std::max(threads, 0);    // 0 = auto, resolved later.
 }
 
 /*
@@ -802,6 +1099,7 @@ bool Shaded_light::setup_buffers(Image_window8& win) {
 		buffers.height_map.assign(count, 0);
 		buffers.facing_map.assign(count, shaded_face_none);
 		buffers.object_ids.assign(count, shaded_id_none);
+		buffers.light_levels.assign(count, 0);
 		buffers.objects.clear();
 		object_index.clear();
 		main_actor_id         = shaded_id_none;
@@ -884,6 +1182,7 @@ void Shaded_light::shift(int dx, int dy) {
 		std::copy_n(buffers.height_map.begin() + from, w, buffers.height_map.begin() + to);
 		std::copy_n(buffers.facing_map.begin() + from, w, buffers.facing_map.begin() + to);
 		std::copy_n(buffers.object_ids.begin() + from, w, buffers.object_ids.begin() + to);
+		std::copy_n(buffers.light_levels.begin() + from, w, buffers.light_levels.begin() + to);
 	};
 	const int rows = area.h - std::abs(dy);
 	if (dy > 0 || (dy == 0 && dx > 0)) {    // Moving up or left: go forwards.
@@ -898,15 +1197,18 @@ void Shaded_light::shift(int dx, int dy) {
 		std::vector<uint16_t> h16(static_cast<size_t>(w));
 		std::vector<uint8_t>  f8(static_cast<size_t>(w));
 		std::vector<uint16_t> i16(static_cast<size_t>(w));
+		std::vector<uint8_t>  l8(static_cast<size_t>(w));
 		for (int r = 0; r < rows; r++) {
 			const int from = buffers.index(src_x, area.y + r);
 			const int to   = buffers.index(dst_x, area.y + r);
 			std::copy_n(buffers.height_map.begin() + from, w, h16.begin());
 			std::copy_n(buffers.facing_map.begin() + from, w, f8.begin());
 			std::copy_n(buffers.object_ids.begin() + from, w, i16.begin());
+			std::copy_n(buffers.light_levels.begin() + from, w, l8.begin());
 			std::copy(h16.begin(), h16.end(), buffers.height_map.begin() + to);
 			std::copy(f8.begin(), f8.end(), buffers.facing_map.begin() + to);
 			std::copy(i16.begin(), i16.end(), buffers.object_ids.begin() + to);
+			std::copy(l8.begin(), l8.end(), buffers.light_levels.begin() + to);
 		}
 	}
 }
@@ -950,6 +1252,72 @@ void Shaded_light::end_paint(Image_window8& win, bool full) {
 		return;
 	}
 	params.object_count = static_cast<int32_t>(buffers.objects.size());
+	finish_due          = true;
+}
+
+/*
+ *  Light the rows of r into levels, in bands on the workers if threaded
+ *  and r is big enough.  Returns the number of bands.
+ */
+
+int Shaded_light::light_pass(const Shaded_rect& r, uint8_t* levels, bool threaded) {
+	if (r.w <= 0 || r.h <= 0) {
+		return 0;
+	}
+	auto band = [&](int b, int bands) {
+		const int y0 = r.y + r.h * b / bands;
+		const int y1 = r.y + r.h * (b + 1) / bands;
+		Shaded_cpu::light_rows(
+				buffers, params, lights.data(), buffers.bin_offsets.data(), buffers.bin_lights.data(), r, y0, y1, levels);
+	};
+	const int bands = threaded && params.threads > 1 && r.w * r.h >= 4096 ? std::min(params.threads, r.h) : 1;
+	if (bands <= 1) {
+		band(0, 1);
+		return 1;
+	}
+	if (!workers || workers->size() != params.threads) {
+		workers = std::make_unique<Shaded_workers>(params.threads);
+	}
+	workers->run(bands, [&](int b) {
+		band(b, bands);
+	});
+	return bands;
+}
+
+void Shaded_light::finish_paint(Image_window8& win, bool full) {
+	if (!finish_due) {
+		return;
+	}
+	finish_due                    = false;
+	const Clock::time_point start = Clock::now();
+	// The lights' own objects, as recorded in this frame (0 = not painted).
+	for (size_t i = 0; i < lights.size(); i++) {
+		const auto it         = object_index.find(light_objects[i]);
+		const int  id         = it != object_index.end() ? it->second : shaded_id_none;
+		lights[i].object_id   = id == shaded_id_overflow ? shaded_id_none : id;
+	}
+	Game_window* gwin  = Game_window::get_instance();
+	params.light_count = static_cast<int32_t>(lights.size());
+	params.bins_x      = (gwin->get_width() + params.bin_size - 1) / params.bin_size;
+	params.bins_y      = (gwin->get_height() + params.bin_size - 1) / params.bin_size;
+	int bands          = 0;
+	switch (backend()) {
+	case Shaded_backend::gpu:    // backend() falls back to CPU.
+	case Shaded_backend::cpu:
+		Shaded_cpu::build_bins(params, lights, buffers.bin_offsets, buffers.bin_lights);
+		bands = light_pass(clip, buffers.light_levels.data(), true);
+		break;
+	}
+	const Clock::time_point stop = Clock::now();
+	if (timing) {
+		const double us = std::chrono::duration<double, std::micro>(stop - start).count();
+		light_passes++;
+		all_light_us += us;
+		if (full) {
+			full_light_passes++;
+			full_light_us += us;
+		}
+	}
 	// Due a dump?  Wanted on a full paint; full paints can be rare (the
 	// game repaints only dirty areas), so after a second's wait a partial
 	// paint does: the record outside its clip is still that of the frame.
@@ -965,9 +1333,27 @@ void Shaded_light::end_paint(Image_window8& win, bool full) {
 		}
 	}
 	if (due) {
+		// The threaded pass must give what one thread does.
+		if (bands > 1) {
+			std::vector<uint8_t> single(buffers.light_levels);
+			light_pass(clip, single.data(), false);
+			bool same = true;
+			for (int y = clip.y; y < clip.y + clip.h && same; y++) {
+				const int idx = buffers.index(clip.x, y);
+				same          = std::equal(
+						 single.begin() + idx, single.begin() + idx + clip.w, buffers.light_levels.begin() + idx);
+			}
+			thread_check = std::string("check threads identical ") + (same ? "yes" : "no") + " ("
+						   + std::to_string(params.threads) + " threads, " + std::to_string(bands) + " bands)";
+		} else {
+			thread_check = "check threads not compared (" + std::to_string(params.threads) + " threads, "
+						   + std::to_string(bands) + " band)";
+		}
 		dump(win, static_cast<int>(dump_next), false, full);
+		thread_check.clear();
 	}
-	if (static_cast<Shaded_view>(params.view) != Shaded_view::normal) {
+	const auto view = static_cast<Shaded_view>(params.view);
+	if (view != Shaded_view::normal && view != Shaded_view::unlit) {
 		uint8_t lut[lut_size];
 		build_lut(lut);
 		auto* frame = static_cast<unsigned char*>(win.get_draw_surface()->pixels);
@@ -1106,7 +1492,14 @@ void Shaded_light::build_lut(uint8_t* lut) const {
 				col = Id_colour(static_cast<unsigned>(code) * 7919u);
 			}
 			break;
+		case Shaded_view::light:
+			if (code > 0) {
+				const int grey = (code - 1) * 255 / (lut_size - 2);
+				col            = Rgb{grey, grey, grey};
+			}
+			break;
 		case Shaded_view::normal:
+		case Shaded_view::unlit:
 		case Shaded_view::count:
 			break;
 		}
@@ -1175,6 +1568,11 @@ void Shaded_light::dump(Image_window8& win, int number, bool view, bool full) {
 	});
 	image("id", [&](int idx) {
 		return Id_colour(buffers.object_ids[idx]);
+	});
+	const int top_level = std::max(params.level_count - 1, 1);
+	image("light", [&](int idx) {
+		const int grey = buffers.light_levels[idx] * 255 / top_level;
+		return Rgb{grey, grey, grey};
 	});
 	std::vector<unsigned char> grey(static_cast<size_t>(gw) * gh * 2);
 	for (int y = 0; y < gh; y++) {
@@ -1276,6 +1674,26 @@ void Shaded_light::dump(Image_window8& win, int number, bool view, bool full) {
 			}
 		}
 	}
+	// Light levels over the game area, and the bins.
+	long level_counts[shaded_light_levels] = {};
+	for (int y = 0; y < gh; y++) {
+		for (int x = 0; x < gw; x++) {
+			level_counts[std::min<int>(buffers.light_levels[buffers.index(x, y)], shaded_light_levels - 1)]++;
+		}
+	}
+	info << "light levels " << params.level_count << " ambient " << params.ambient_level << " dither " << params.dither
+		 << " softness " << params.softness << " facing " << params.facing_min << " brightness " << params.brightness
+		 << " radius " << params.radius_scale << "\n"
+		 << "light level pixels";
+	for (const long n : level_counts) {
+		info << " " << n;
+	}
+	info << "\n"
+		 << "bins " << params.bins_x << "x" << params.bins_y << " of " << params.bin_size << " px, entries "
+		 << buffers.bin_lights.size() << "\n";
+	if (!thread_check.empty()) {
+		info << thread_check << "\n";
+	}
 	info << "lights " << lights.size() << " hash " << std::hex << light_hash << std::dec << "\n";
 	for (size_t i = 0; i < lights.size(); i++) {
 		const Shaded_light_record& rec = lights[i];
@@ -1300,5 +1718,9 @@ void Shaded_light::report_timing() const {
 	std::cout << "SHADED-TIMING: record=" << (record_on ? "on" : "off") << " game=" << game_width << "x" << game_height
 			  << " full_paints=" << full_paints << " paint_map_avg_us=" << paint_map_us / n << " record_avg_us=" << record_us / n
 			  << " all_paints=" << paints << " avg_pixels=" << paint_pixels / np << " all_paint_map_avg_us=" << all_paint_us / np
-			  << " all_record_avg_us=" << all_record_us / np << std::endl;
+			  << " all_record_avg_us=" << all_record_us / np
+			  << " light_avg_us=" << full_light_us / static_cast<double>(std::max(full_light_passes, 1LL))
+			  << " all_light_avg_us=" << all_light_us / static_cast<double>(std::max(light_passes, 1LL))
+			  << " light_passes=" << light_passes << " threads=" << params.threads << " lights=" << params.light_count
+			  << std::endl;
 }
