@@ -73,6 +73,7 @@
 		8AEBA98E1475A21C0172E554 /* perf.cc in Sources */ = {isa = PBXBuildFile; fileRef = 8ADFFDFA25DE791000FC4D3A /* perf.cc */; };
 		5ADE1A0130F0C0DE00A1B003 /* shadedlight.cc in Sources */ = {isa = PBXBuildFile; fileRef = 5ADE1A0130F0C0DE00A1B002 /* shadedlight.cc */; };
 		5ADE1A0130F0C0DE00A1C003 /* shadedgrid.cc in Sources */ = {isa = PBXBuildFile; fileRef = 5ADE1A0130F0C0DE00A1C002 /* shadedgrid.cc */; };
+		5ADE1A0130F0C0DE00A1D003 /* shadedweather.cc in Sources */ = {isa = PBXBuildFile; fileRef = 5ADE1A0130F0C0DE00A1D002 /* shadedweather.cc */; };
 		8AF2AFDF2016708100696E08 /* joypad-glass-southwest.png in Resources */ = {isa = PBXBuildFile; fileRef = 8AF2AFD62016707F00696E08 /* joypad-glass-southwest.png */; };
 		8AF2AFE02016708100696E08 /* joypad-glass-north.png in Resources */ = {isa = PBXBuildFile; fileRef = 8AF2AFD72016708000696E08 /* joypad-glass-north.png */; };
 		8AF2AFE12016708100696E08 /* joypad-glass.png in Resources */ = {isa = PBXBuildFile; fileRef = 8AF2AFD82016708000696E08 /* joypad-glass.png */; };
@@ -440,6 +441,8 @@
 		5ADE1A0130F0C0DE00A1C001 /* shadedgrid.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; name = shadedgrid.h; path = ../shadedgrid.h; sourceTree = "<group>"; };
 		5ADE1A0130F0C0DE00A1C002 /* shadedgrid.cc */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.cpp.cpp; name = shadedgrid.cc; path = ../shadedgrid.cc; sourceTree = "<group>"; };
 		5ADE1A0130F0C0DE00A1C004 /* shadedgrid_data.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; name = shadedgrid_data.h; path = ../shadedgrid_data.h; sourceTree = "<group>"; };
+		5ADE1A0130F0C0DE00A1D001 /* shadedweather.h */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.c.h; name = shadedweather.h; path = ../shadedweather.h; sourceTree = "<group>"; };
+		5ADE1A0130F0C0DE00A1D002 /* shadedweather.cc */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.cpp.cpp; name = shadedweather.cc; path = ../shadedweather.cc; sourceTree = "<group>"; };
 		8AE3D1093001610500BCB1FF /* scene_layer.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = scene_layer.h; path = ../scene_layer.h; sourceTree = SOURCE_ROOT; };
 		8AE8B9BC2E400B4F0094DF3C /* SDL3.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; path = SDL3.framework; sourceTree = BUILT_PRODUCTS_DIR; };
 		8AF2AFD62016707F00696E08 /* joypad-glass-southwest.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "joypad-glass-southwest.png"; sourceTree = "<group>"; };
@@ -1136,6 +1139,8 @@
 				5ADE1A0130F0C0DE00A1C001 /* shadedgrid.h */,
 				5ADE1A0130F0C0DE00A1C002 /* shadedgrid.cc */,
 				5ADE1A0130F0C0DE00A1C004 /* shadedgrid_data.h */,
+				5ADE1A0130F0C0DE00A1D001 /* shadedweather.h */,
+				5ADE1A0130F0C0DE00A1D002 /* shadedweather.cc */,
 				E700DC341A6E30A7006C8BE4 /* actions.cc */,
 				E700DC351A6E30A7006C8BE4 /* actions.h */,
 				E700DC361A6E30A7006C8BE4 /* actorio.cc */,
@@ -1990,6 +1995,7 @@
 				8AEBA98E1475A21C0172E554 /* perf.cc in Sources */,
 				5ADE1A0130F0C0DE00A1B003 /* shadedlight.cc in Sources */,
 				5ADE1A0130F0C0DE00A1C003 /* shadedgrid.cc in Sources */,
+				5ADE1A0130F0C0DE00A1D003 /* shadedweather.cc in Sources */,
 				8AE5D3C21D2A0D9601379947 /* cheat_screen_actors.cc in Sources */,
 				8AC797C81C8D0E4F001AF014 /* zip.cc in Sources */,
 				E700DF441A6E34C6006C8BE4 /* debugserver.cc in Sources */,

@@ -115,6 +115,8 @@ EXULTSOURCES =	\
 	shadedgrid.cc	\
 	shadedgrid.h	\
 	shadedgrid_data.h	\
+	shadedweather.cc	\
+	shadedweather.h	\
 	shapeid.cc	\
 	shapeid.h	\
 	singles.h	\

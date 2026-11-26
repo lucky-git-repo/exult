@@ -37,6 +37,7 @@ MAIN_OBJS:=actions.o \
 	schedule.o \
 	shadedlight.o \
 	shadedgrid.o \
+	shadedweather.o \
 	shapeid.o \
 	touchui.o \
 	tqueue.o \
