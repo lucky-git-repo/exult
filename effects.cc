@@ -1639,6 +1639,7 @@ public:
 
 Lightning_effect::~Lightning_effect() {
 	if (flashing) {    // Be sure palette is restored.
+		Shaded_light::get().lightning(false);
 		Game_window::get_instance()->get_clock()->set_palette();
 	}
 }
@@ -1653,6 +1654,7 @@ void Lightning_effect::handle_event(
 	const int r     = rand();    // Get a random #.
 	int       delay = 100;       // Delay for next time.
 	if (flashing) {              // Just turned white?  Restore.
+		Shaded_light::get().lightning(false);
 		gclock->set_palette();
 		flashing = false;
 		active   = false;
@@ -1671,7 +1673,9 @@ void Lightning_effect::handle_event(
 		Audio::get_ptr()->play_sound_effect(Audio::game_sfx(62));
 		active   = true;
 		flashing = true;
-		gwin->get_pal()->set(PALETTE_LIGHTNING);
+		if (!Shaded_light::get().lightning(true)) {
+			gwin->get_pal()->set(PALETTE_LIGHTNING);
+		}
 		delay = (1 + r % 2) * 25;
 	}
 	gwin->get_tqueue()->add(curtime + delay, this, udata);

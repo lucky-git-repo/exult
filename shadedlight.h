@@ -915,6 +915,16 @@ namespace Shaded_cpu {
 			const Shaded_scene_buffers& buf, const Shaded_light_params& params, const Shaded_light_record* lights,
 			const uint32_t* bin_offsets, const uint16_t* bin_lights, const Shaded_grid_volume* ray_grid,
 			Shaded_shadow_set& set, const Shaded_rect& cells, int y0, int y1, long& traces);
+	// Cell rows [y0, y1) of the lightning flash's screen map (set.maps[0],
+	// over the cells rectangle): the transmittance from each recorded
+	// receiver along the flash's direction (flash.x, y, z, as a
+	// directional light) up to the top of the grid, in screen space times,
+	// with vol, the grid's.  Unrecorded receivers get 255.  Adds the number
+	// of screen traces to traces.
+	void flash_shadow_rows(
+			const Shaded_scene_buffers& buf, const Shaded_light_params& params, const Shaded_grid_volume* vol,
+			const Shaded_light_record& flash, Shaded_shadow_set& set, const Shaded_rect& cells, int y0, int y1,
+			long& traces);
 	// Rows [y0, y1) (of the map) of a depth-aware 3x3 blur of a screen map
 	// into out + map.offset.
 	void blur_shadow_rows(
@@ -932,8 +942,9 @@ namespace Shaded_cpu {
 	// light but the self-light is scaled by 1 - strength * (1 - Ts * Tg)
 	// and shadow_out (if not null) gets 255 * shadowed / unshadowed light.
 	// With weather, the ambient (sky) term of a recorded pixel is dimmed
-	// by the clouds over it as far as it is open to the sky, and wout's
-	// buffers (those not null) get the weather outputs.
+	// by the clouds over it as far as it is open to the sky, a lightning
+	// flash lifts the faces it reaches, and wout's buffers (those not
+	// null) get the weather outputs.
 	void light_rows(
 			const Shaded_scene_buffers& buf, const Shaded_light_params& params, const Shaded_light_record* lights,
 			const uint32_t* bin_offsets, const uint16_t* bin_lights, const Shaded_rect& r, int y0, int y1,
@@ -1023,6 +1034,13 @@ public:
 	bool cloud_shadows_shown() const {
 		return weather_wanted() && params.cloud_shadows > 0.0f && lit_active;
 	}
+
+	// Lightning_effect's flash: on = the flash starts, false = it ends.
+	// Starting returns true when shaded light shows it (a brief strong sky
+	// light from a direction, with traced shadows), false when the caller
+	// must show the LIGHTNING palette as before.  A flash is shown on at
+	// least one painted frame, however soon it ends.
+	bool lightning(bool on);
 
 	// Palettes lighting works over: DUSK/DAWN, NIGHT and SPELL, and with
 	// weather lighting OVERCAST, and DAY while there is weather.
@@ -1230,7 +1248,20 @@ private:
 	std::array<int, 5>   lit_fog_track{-1, -1, -1, -1, -1};
 	bool                 weather_test       = false;    // EXULT_SHADED_WEATHER_TEST.
 	bool                 weather_test_done  = false;
-	int                  dump_flash         = 0;    // EXULT_SHADED_DUMP_FLASH (lightning).
+	// Lightning: the flash shown now, its direction (tiles, tiles, lifts
+	// per unit, towards the flash), the flash tables fitted to LIGHTNING
+	// and the flash dumps left to take (EXULT_SHADED_DUMP_FLASH).
+	bool                 flash_on          = false;
+	bool                 flash_shown       = false;    // Painted at least once.
+	bool                 flash_end_pending = false;    // Ended before it was painted.
+	int                  flash_count       = 0;
+	float                flash_dir[3]      = {0.0f, 0.0f, 1.0f};
+	std::vector<uint8_t> flash_table;    // shaded_flash_table_size.
+	int                  flash_dumps_left  = 0;
+	int                  flash_dumps_taken = 0;
+	long                 flash_traces      = 0;    // Of the last flash pass.
+	double               flash_pass_us     = 0;
+	double               flash_us          = 0;    // Totals over all flash passes.
 	std::string          weather_info;    // For the dump info.
 	// Headless debug hooks (EXULT_SHADED_HOUR, EXULT_SHADED_TELEPORT).
 	int  pending_hour     = -1;
@@ -1288,6 +1319,8 @@ private:
 	bool               load_weather_refs();
 	bool               prepare_weather();
 	void               prepare_weather_pass();
+	void               flash_pass(const Shaded_rect& r);
+	void               end_flash();
 	int                light_pass(
 					   const Shaded_rect& r, uint8_t* levels, bool threaded, unsigned char* frame = nullptr,
 					   const Shaded_shadow_set* shadows = nullptr, uint8_t* shadow_out = nullptr,

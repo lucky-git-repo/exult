@@ -1411,6 +1411,40 @@ void Shaded_cpu::screen_shadow_rows(
 	}
 }
 
+void Shaded_cpu::flash_shadow_rows(
+		const Shaded_scene_buffers& buf, const Shaded_light_params& params, const Shaded_grid_volume* vol,
+		const Shaded_light_record& flash, Shaded_shadow_set& set, const Shaded_rect& cells, int y0, int y1, long& traces) {
+	if (set.maps.empty() || flash.z <= 0.0f) {
+		return;
+	}
+	const Shaded_shadow_map& map = set.maps[0];
+	for (int cy = y0; cy < y1; cy++) {
+		uint8_t* out = set.map_data.data() + map.offset + static_cast<size_t>(cy - map.y) * map.w;
+		for (int cx = cells.x; cx < cells.x + cells.w; cx++) {
+			const int idx = Cell_pixel(buf, set, cx, cy);
+			if ((buf.facing_map[idx] & shaded_face_mask) == shaded_face_none) {
+				out[cx - map.x] = 255;
+				continue;
+			}
+			const int          row = (idx - buf.origin) / buf.stride;
+			const int          col = idx - buf.origin - row * buf.stride;
+			const Shaded_point p   = Pixel_world(buf, params, col, row);
+			float              t   = 1.0f;
+			if (p.z < shaded_flash_top) {
+				// Along the flash's direction up to the top of the grid.
+				const float        s = (shaded_flash_top - p.z) / flash.z;
+				const Shaded_point target{p.x + flash.x * s, p.y + flash.y * s, shaded_flash_top};
+				t = Screen_transmittance(buf, params, set, p, target, buf.object_ids[idx], 0);
+				traces++;
+				if (vol && t > 0.0f) {
+					t *= flash_grid_transmittance(*vol, p, target);
+				}
+			}
+			out[cx - map.x] = static_cast<uint8_t>(std::lround(std::clamp(t, 0.0f, 1.0f) * 255.0f));
+		}
+	}
+}
+
 void Shaded_cpu::blur_shadow_rows(
 		const Shaded_scene_buffers& buf, const Shaded_shadow_set& set, const Shaded_shadow_map& map, int y0, int y1,
 		uint8_t* out) {
@@ -1520,6 +1554,18 @@ void Shaded_cpu::light_rows(
 	const float facing    = params.facing_min;
 	uint8_t*    sky_out   = weather && wout ? wout->sky : nullptr;
 	uint8_t*    fog_out   = weather && wout ? wout->fog : nullptr;    // Codes 0 without fog.
+	uint8_t*    flash_out = weather && wout ? wout->flash : nullptr;    // Levels 0 without a flash.
+	// A lightning flash: its shadow map and unit direction in tiles.
+	const Shaded_shadow_map* flash_map = weather && params.flash > 0.0f && weather->flash_map >= 0
+														 && static_cast<size_t>(weather->flash_map) < weather->flash.maps.size()
+												 ? &weather->flash.maps[static_cast<size_t>(weather->flash_map)]
+												 : nullptr;
+	float flash_l[3] = {params.flash_x, params.flash_y, params.flash_z * params.tiles_per_lift};
+	if (const float len = std::sqrt(flash_l[0] * flash_l[0] + flash_l[1] * flash_l[1] + flash_l[2] * flash_l[2]); len > 0.0f) {
+		for (float& c : flash_l) {
+			c /= len;
+		}
+	}
 	// Shortest way round the wrapped world.
 	auto wrap = [tiles](float d) {
 		if (d > tiles * 0.5f) {
@@ -1594,6 +1640,9 @@ void Shaded_cpu::light_rows(
 				}
 				if (fog_out) {
 					fog_out[idx] = 0;
+				}
+				if (flash_out) {
+					flash_out[idx] = 0;
 				}
 				continue;
 			}
@@ -1678,8 +1727,26 @@ void Shaded_cpu::light_rows(
 				full += l.intensity * Shaded_falloff(d2 / r2) * (facing + (1.0f - facing) * ndotl);
 				sum += l.intensity * f * Shaded_falloff(d2 / r2) * (facing + (1.0f - facing) * ndotl);
 			}
-			const float level = ambient_p + (1.0f - ambient_p) * (1.0f - std::exp(-sum * params.brightness * inv_soft));
-			levels[idx]       = quantise(level, x, y);
+			float level = ambient_p + (1.0f - ambient_p) * (1.0f - std::exp(-sum * params.brightness * inv_soft));
+			if (flash_map) {
+				// The flash lifts faces turned to it as far as its shadows
+				// let it through; a trace through a penumbra's last 1/32 is
+				// left out, so every pixel it lifts has a flash level.
+				float       f     = 0.0f;
+				const float ndotl = n.x * flash_l[0] + n.y * flash_l[1] + n.z * flash_l[2];
+				if (ndotl > 0.0f) {
+					const float t = shadow_screen_at(buf, weather->flash, *flash_map, x, y, buf.height_map[idx]);
+					f             = std::min(params.flash * t * (facing + (1.0f - facing) * ndotl), 1.0f);
+					f             = f < 1.0f / 32.0f ? 0.0f : f;
+				}
+				level += (1.0f - level) * f;
+				if (flash_out) {
+					flash_out[idx] = static_cast<uint8_t>(f > 0.0f ? std::max(quantise7(f * 7.0f, x + 3, y + 2), 1) : 0);
+				}
+			} else if (flash_out) {
+				flash_out[idx] = 0;
+			}
+			levels[idx] = quantise(level, x, y);
 			if (fog_out) {
 				// Fog in front of the pixel, lit by the sky and by the lamps
 				// whose light it scatters (no facing, no shadows).
@@ -2011,7 +2078,7 @@ Shaded_light::Shaded_light()
 	env_switch("EXULT_SHADED_LIGHTNING_SHADOWS", params.lightning_shadows);
 	env_switch("EXULT_SHADED_PRECIPITATION", params.precipitation);
 	if (const char* flash = std::getenv("EXULT_SHADED_DUMP_FLASH"); flash && *flash) {
-		dump_flash = std::max(std::atoi(flash), 0);
+		flash_dumps_left = std::max(std::atoi(flash), 0);
 	}
 	if (const char* test = std::getenv("EXULT_SHADED_WEATHER_TEST"); test && *test && *test != '0') {
 		weather_test = true;
@@ -2453,7 +2520,7 @@ bool Shaded_light::prepare_paint() {
 	// The self-test needs the game's palettes for its fog table checks.
 	if (weather_test && !weather_test_done && load_weather_refs()) {
 		weather_test_done = true;
-		Shaded_weather_selftest(ref_pals[0].data(), weather_pals[0].data());
+		Shaded_weather_selftest(ref_pals[0].data(), weather_pals[0].data(), weather_pals[1].data());
 	}
 	run_debug_hooks();
 	load_table();
@@ -2552,7 +2619,7 @@ bool Shaded_light::prepare_weather() {
 	if (weather_wanted() && gwin->get_effects()) {
 		gwin->get_effects()->get_shaded_weather(in);
 	}
-	weather_present = weather_wanted() && (in.clouds_effect || in.fog);
+	weather_present = weather_wanted() && (in.clouds_effect || in.fog || flash_on);
 	bool changed    = false;
 	if (weather_present != last_weather_present) {
 		// DAY became lightable, or stopped being so: filter the palette again.
@@ -2625,8 +2692,14 @@ bool Shaded_light::prepare_weather() {
 	// as does the fog setting in or lifting.
 	const bool fog_moved
 			= lit_active && (params.fog ? fog_track : std::array<int, 5>{-1, -1, -1, -1, -1}) != lit_fog_track;
+	// Lightning: a sky light from the flash's direction.
+	const bool flash  = weather_wanted() && flash_on;
+	params.flash      = flash ? 1.0f : 0.0f;
+	params.flash_x    = flash ? flash_dir[0] : 0.0f;
+	params.flash_y    = flash ? flash_dir[1] : 0.0f;
+	params.flash_z    = flash ? flash_dir[2] : 0.0f;
 	params.weather_active
-			= weather_wanted() && (!set.clouds.empty() || params.overcast > 0.0f || params.fog) ? 1 : 0;
+			= weather_wanted() && (!set.clouds.empty() || params.overcast > 0.0f || params.fog || flash) ? 1 : 0;
 	return changed || fog_moved || (lit_active && cloud_hash != lit_cloud_hash);
 }
 
@@ -2673,6 +2746,138 @@ void Shaded_light::prepare_weather_pass() {
 		open_generation = -1;
 	}
 	weather_set_on = true;
+}
+
+/*
+ *  A lightning flash starts (on) or ends.  Each flash comes from its own
+ *  direction (golden-ratio steps round the compass) at a fixed elevation.
+ */
+
+bool Shaded_light::lightning(bool on) {
+	if (on) {
+		if (!weather_wanted() || !params.lightning_shadows || !lit_active) {
+			return false;    // The LIGHTNING palette, as without shaded light.
+		}
+		flash_count++;
+		constexpr double golden    = 0.618034;
+		constexpr double two_pi    = 6.283185307179586;
+		const double     turn      = static_cast<double>(flash_count) * golden;
+		const double     azimuth   = two_pi * (turn - std::floor(turn));
+		const double     elevation = static_cast<double>(shaded_flash_elevation) * two_pi / 360.0;
+		flash_dir[0]               = static_cast<float>(std::cos(elevation) * std::cos(azimuth));
+		flash_dir[1]               = static_cast<float>(std::cos(elevation) * std::sin(azimuth));
+		flash_dir[2]               = static_cast<float>(std::sin(elevation)) / params.tiles_per_lift;
+		flash_on                   = true;
+		flash_shown                = false;
+		flash_end_pending          = false;
+		need_full                  = true;
+		Game_window::get_instance()->set_all_dirty();
+		std::cout << "SHADED: flash " << flash_count << " dir " << flash_dir[0] << "," << flash_dir[1] << ","
+				  << flash_dir[2] << std::endl;
+		return true;
+	}
+	if (!flash_on) {
+		return false;
+	}
+	if (flash_shown) {
+		end_flash();
+	} else {
+		flash_end_pending = true;    // finish_paint ends it once painted.
+	}
+	return true;
+}
+
+/*
+ *  The flash is over: the next paint is full and without it.  (From
+ *  finish_paint the dirty area is cleared after the paint, so that paint
+ *  comes with the next dirty area: the storm's clouds move every 100 ms.)
+ */
+
+void Shaded_light::end_flash() {
+	flash_on          = false;
+	flash_shown       = false;
+	flash_end_pending = false;
+	need_full         = true;
+	Game_window::get_instance()->set_all_dirty();
+}
+
+/*
+ *  The flash's screen map over rectangle r (grown for the upsampling):
+ *  each receiver traced towards the flash in screen space and through the
+ *  grid, in bands, then blurred as the lamps' maps are.
+ */
+
+void Shaded_light::flash_pass(const Shaded_rect& r) {
+	Shaded_weather_set& ws  = *weather_set;
+	Shaded_shadow_set&  set = ws.flash;
+	ws.flash_map            = -1;
+	flash_traces            = 0;
+	flash_pass_us           = 0;
+	if (params.flash <= 0.0f || r.w <= 0 || r.h <= 0) {
+		return;
+	}
+	const Clock::time_point start = Clock::now();
+	Game_window*            gwin  = Game_window::get_instance();
+	const int               gw    = gwin->get_width();
+	const int               gh    = gwin->get_height();
+	Shaded_grid*            grid  = Shaded_grid::active;
+	const Shaded_grid_volume* vol = grid && grid->get_volume().size_x > 0 ? &grid->get_volume() : nullptr;
+	const int               res   = params.shadow_resolution;
+	set.resolution                = res;
+	set.area_w                    = gw;
+	set.area_h                    = gh;
+	set.grid_tx                   = vol ? vol->origin_tx : 0;
+	set.grid_ty                   = vol ? vol->origin_ty : 0;
+	set.screen                    = 1;
+	set.ray_grid                  = vol ? 1 : 0;
+	set.strength                  = 1.0f;
+	set.light_boxes.clear();
+	set.light_map.assign(1, 0);
+	set.light_field.assign(1, -1);
+	set.maps.clear();
+	set.fields.clear();
+	set.field_data.clear();
+	const Shaded_rect need = Intersect(Shaded_rect{r.x - 2 * res, r.y - 2 * res, r.w + 4 * res, r.h + 4 * res},
+									   Shaded_rect{0, 0, gw, gh});
+	if (need.w <= 0 || need.h <= 0) {
+		set.map_data.clear();
+		return;
+	}
+	Shaded_shadow_map m;
+	m.x     = Floor_div(need.x, res);
+	m.y     = Floor_div(need.y, res);
+	m.w     = Floor_div(need.x + need.w - 1, res) - m.x + 1;
+	m.h     = Floor_div(need.y + need.h - 1, res) - m.y + 1;
+	m.build = 1;
+	set.maps.push_back(m);
+	set.map_data.assign(static_cast<size_t>(m.w) * static_cast<size_t>(m.h), 255);
+	// The flash as a directional light (towards it, tiles, tiles, lifts).
+	Shaded_light_record flash{};
+	flash.x     = params.flash_x;
+	flash.y     = params.flash_y;
+	flash.z     = params.flash_z;
+	flash.flags = shaded_light_directional;
+	const Shaded_rect cells{m.x, m.y, m.w, m.h};
+	const int         bands = params.threads > 1 ? std::min(params.threads, m.h) : 1;
+	std::vector<long> traces(static_cast<size_t>(std::max(bands, 1)), 0);
+	run_bands(bands, [&](int b) {
+		Shaded_cpu::flash_shadow_rows(
+				buffers, params, vol, flash, set, cells, cells.y + cells.h * b / bands, cells.y + cells.h * (b + 1) / bands,
+				traces[static_cast<size_t>(b)]);
+	});
+	for (const long n : traces) {
+		flash_traces += n;
+	}
+	if (params.shadow_softness > 0.0f) {
+		shadow_scratch.resize(set.map_data.size());
+		run_bands(bands, [&](int b) {
+			Shaded_cpu::blur_shadow_rows(buffers, set, m, m.h * b / bands, m.h * (b + 1) / bands, shadow_scratch.data());
+		});
+		std::copy_n(shadow_scratch.begin(), set.map_data.size(), set.map_data.begin());
+	}
+	ws.flash_map  = 0;
+	flash_pass_us = std::chrono::duration<double, std::micro>(Clock::now() - start).count();
+	flash_us += flash_pass_us;
 }
 
 bool Shaded_light::lightable_palette(int n) {
@@ -2738,7 +2943,8 @@ bool Shaded_light::load_refs() {
 
 /*
  *  Read the weather palettes (FOG and LIGHTNING, raw 6-bit colours) and
- *  fit the fog tables to FOG, once per game or mod.  False if they (or the
+ *  fit the fog tables to FOG and the flash tables to LIGHTNING, once per
+ *  game or mod.  False if they (or the
  *  ramp's refs) cannot be read yet.
  */
 
@@ -2747,12 +2953,14 @@ bool Shaded_light::load_weather_refs() {
 		return false;
 	}
 	const std::string key = Game_key();
-	if (weather_pals.size() == 2 && key == weather_refs_game && fog_table.size() == shaded_fog_table_size) {
+	if (weather_pals.size() == 2 && key == weather_refs_game && fog_table.size() == shaded_fog_table_size
+		&& flash_table.size() == shaded_flash_table_size) {
 		return true;
 	}
 	weather_pals.clear();
 	weather_refs_game.clear();
 	fog_table.clear();
+	flash_table.clear();
 	try {
 		for (const int n : {PALETTE_FOG, PALETTE_LIGHTNING}) {
 			Palette tmp;
@@ -2771,10 +2979,12 @@ bool Shaded_light::load_weather_refs() {
 	}
 	const Clock::time_point start = Clock::now();
 	fog_table.resize(shaded_fog_table_size);
+	flash_table.resize(shaded_flash_table_size);
 	switch (backend()) {
 	case Shaded_backend::gpu:    // backend() falls back to CPU.
 	case Shaded_backend::cpu:
 		Shaded_cpu::build_fog_tables(ref_pals[0].data(), weather_pals[0].data(), fog_fit_mix, fog_colour, fog_table.data());
+		Shaded_cpu::build_flash_table(ref_pals[0].data(), weather_pals[1].data(), flash_table.data());
 		break;
 	}
 	weather_prep_us += std::chrono::duration<double, std::micro>(Clock::now() - start).count();
@@ -3098,19 +3308,20 @@ int Shaded_light::light_pass(
 	if (r.w <= 0 || r.h <= 0) {
 		return 0;
 	}
-	const bool fog_on = params.fog && fog_table.size() == shaded_fog_table_size;
-	auto       band   = [&](int b, int bands) {
+	const bool fog_on   = params.fog && fog_table.size() == shaded_fog_table_size;
+	const bool flash_on = params.flash > 0.0f && flash_table.size() == shaded_flash_table_size;
+	auto       band     = [&](int b, int bands) {
 		const int y0 = r.y + r.h * b / bands;
 		const int y1 = r.y + r.h * (b + 1) / bands;
 		Shaded_cpu::light_rows(
 				buffers, params, lights.data(), buffers.bin_offsets.data(), buffers.bin_lights.data(), r, y0, y1, levels,
 				shadows, shadow_out, weather, wout);
 		if (frame && weather) {
-			// The fog table only while there is fog (the flash table comes
-			// with the lightning).
+			// The fog table only while there is fog, the flash table only
+			// during a flash.
 			Shaded_cpu::apply_weather_rows(
 					buffers, r, y0, y1, levels, remap.data(), wout ? wout->fog : nullptr, fog_on ? fog_table.data() : nullptr,
-					wout ? wout->flash : nullptr, nullptr, frame);
+					wout ? wout->flash : nullptr, flash_on ? flash_table.data() : nullptr, frame);
 		} else if (frame) {
 			Shaded_cpu::apply_light_rows(buffers, r, y0, y1, levels, remap.data(), frame);
 		}
@@ -3553,7 +3764,8 @@ void Shaded_light::check_weather(const Shaded_rect& r) {
 	out << "weather " << (weather_wanted() ? "on" : "off") << " active " << (weather_set_on ? "yes" : "no") << " clouds "
 		<< set.clouds.size() << " (effect " << (in.clouds_effect ? "yes" : "no") << ", " << in.clouds.size()
 		<< " reported) fog " << (in.fog ? "yes" : "no") << " rain " << (in.rain ? "yes" : "no") << " snow "
-		<< (in.snow ? "yes" : "no") << " flash 0 overcast " << params.overcast << "\n"
+		<< (in.snow ? "yes" : "no") << " flash " << (params.flash > 0.0f ? flash_count : 0) << " overcast "
+		<< params.overcast << "\n"
 		<< "weather cloud_shadows " << params.cloud_shadows << " cloud_softness " << params.cloud_softness
 		<< " overcast_soften " << params.overcast_soften << " fade " << params.fog_fade << " shadow strength "
 		<< params.shadow_strength << " softness " << params.shadow_softness << " (config " << shadow_strength_config
@@ -3579,13 +3791,25 @@ void Shaded_light::check_weather(const Shaded_rect& r) {
 	std::vector<uint8_t> plain(buffers.light_levels);
 	light_pass(r, plain.data(), false, nullptr, shadow_set_on ? &shadow_set : nullptr, nullptr);
 	long   outdoor = 0, covered = 0, violations = 0, fogged = 0;
+	long   flash_lit = 0, flash_shadowed = 0, flash_covered = 0;    // Faces turned to the flash.
 	double sky_sum = 0;
+	const float flash_l[3] = {params.flash_x, params.flash_y, params.flash_z * params.tiles_per_lift};
 	for (int y = r.y; y < r.y + r.h; y++) {
 		const int idx = buffers.index(r.x, y);
 		for (int i = idx; i < idx + r.w; i++) {
 			fogged += buffers.fog_codes[i] != 0 ? 1 : 0;
-			if ((buffers.facing_map[i] & shaded_face_mask) == shaded_face_none) {
+			const uint8_t face = buffers.facing_map[i] & shaded_face_mask;
+			if (face == shaded_face_none) {
 				continue;
+			}
+			if (params.flash > 0.0f) {
+				const Shaded_normalf n = Shaded_pixel_normal(buffers, i, face);
+				if (n.x * flash_l[0] + n.y * flash_l[1] + n.z * flash_l[2] > 0.0f) {
+					const bool lit = buffers.flash_levels[i] != 0;
+					flash_lit += lit ? 1 : 0;
+					flash_shadowed += lit ? 0 : 1;
+					flash_covered += lit && buffers.sky_levels[i] == 0 ? 1 : 0;
+				}
 			}
 			if (buffers.sky_levels[i] == 0) {
 				// Nor any fog under cover.
@@ -3602,6 +3826,13 @@ void Shaded_light::check_weather(const Shaded_rect& r) {
 	out << "weather fog " << (params.fog ? "on" : "off") << " mix " << params.fog_mix << " colour " << fog_colour[0] << ","
 		<< fog_colour[1] << "," << fog_colour[2] << " fogged px " << fogged << " avatar " << params.avatar_x << ","
 		<< params.avatar_y << "," << params.avatar_z << "\n";
+	if (params.flash > 0.0f) {
+		// Faces turned to the flash: lit by it, or in its shadow; and
+		// those lit under cover (through an opening).
+		out << "weather flash " << flash_count << " dir " << params.flash_x << "," << params.flash_y << "," << params.flash_z
+			<< " lit px " << flash_lit << " shadowed px " << flash_shadowed << " (lit under cover " << flash_covered
+			<< ") traces " << flash_traces << " flash_us " << flash_pass_us << "\n";
+	}
 	out << "weather outdoor mean sky " << (outdoor > 0 ? sky_sum / static_cast<double>(outdoor) : 0.0) << "\n"
 		<< "check weather indoor violations " << violations << " (outdoor px " << outdoor << ", covered px " << covered
 		<< ")\n";
@@ -3628,6 +3859,12 @@ void Shaded_light::finish_paint(Image_window8& win, bool full) {
 			due           = ms >= dump_at[dump_next] && (full || ms >= dump_at[dump_next] + 1000);
 		}
 	}
+	// The first full paints of lightning flashes are dumped too, as 100 on
+	// (EXULT_SHADED_DUMP_FLASH).
+	const bool flash_dump = !due && !dump_dir.empty() && flash_dumps_left > 0 && full && lit_active && params.flash > 0.0f;
+	const bool checks     = due || flash_dump;
+	const int  dump_number
+			= flash_dump ? shaded_flash_dump_first + flash_dumps_taken : static_cast<int>(dump_next);
 	// The pass runs while lighting is active, for the light views and for
 	// dumps; it relights the frame only while active and not viewing unlit.
 	const auto view  = static_cast<Shaded_view>(params.view);
@@ -3638,7 +3875,7 @@ void Shaded_light::finish_paint(Image_window8& win, bool full) {
 	params.lit       = apply ? 1 : 0;
 	relit_pixels     = 0;
 	unlit_frame.clear();
-	if (due && apply) {
+	if (checks && apply) {
 		unlit_frame.assign(frame, frame + buffers.height_map.size());
 	}
 	int bands      = 0;
@@ -3670,6 +3907,12 @@ void Shaded_light::finish_paint(Image_window8& win, bool full) {
 				}
 			}
 			prepare_weather_pass();
+			if (weather_set_on && params.flash > 0.0f) {
+				flash_pass(clip);
+			} else {
+				weather_set->flash_map = -1;
+				flash_pass_us          = 0;
+			}
 			if (!weather_set_on) {    // No weather: open sky, no fog, no flash.
 				for (int y = clip.y; y < clip.y + clip.h; y++) {
 					const int idx = buffers.index(clip.x, y);
@@ -3694,7 +3937,8 @@ void Shaded_light::finish_paint(Image_window8& win, bool full) {
 		}
 		if (timing) {
 			// The light pass without the shadows, which are timed apart.
-			const double us = std::chrono::duration<double, std::micro>(Clock::now() - start).count() - shadow_us;
+			const double us
+					= std::chrono::duration<double, std::micro>(Clock::now() - start).count() - shadow_us - flash_pass_us;
 			light_passes++;
 			all_light_us += us;
 			if (full) {
@@ -3713,14 +3957,17 @@ void Shaded_light::finish_paint(Image_window8& win, bool full) {
 				}
 			}
 		}
+		// The flash has been painted: it may end now.
+		flash_shown = flash_shown || (flash_on && weather_set_on && params.flash > 0.0f);
 	}
-	if (due) {
+	if (checks) {
 		// The threaded pass must give what one thread does.
 		if (bands > 1) {
 			std::vector<uint8_t>     single(buffers.light_levels);
 			std::vector<uint8_t>     single_sky(buffers.sky_levels);
 			std::vector<uint8_t>     single_fog(buffers.fog_codes);
-			const Shaded_weather_out single_out{single_sky.data(), single_fog.data(), nullptr};
+			std::vector<uint8_t>     single_flash(buffers.flash_levels);
+			const Shaded_weather_out single_out{single_sky.data(), single_fog.data(), single_flash.data()};
 			light_pass(
 					clip, single.data(), false, nullptr, shadow_set_on ? &shadow_set : nullptr, nullptr,
 					weather_set_on ? weather_set.get() : nullptr, weather_set_on ? &single_out : nullptr);
@@ -3732,7 +3979,10 @@ void Shaded_light::finish_paint(Image_window8& win, bool full) {
 					   && std::equal(
 							   single_sky.begin() + idx, single_sky.begin() + idx + clip.w, buffers.sky_levels.begin() + idx)
 					   && std::equal(
-							   single_fog.begin() + idx, single_fog.begin() + idx + clip.w, buffers.fog_codes.begin() + idx);
+							   single_fog.begin() + idx, single_fog.begin() + idx + clip.w, buffers.fog_codes.begin() + idx)
+					   && std::equal(
+							   single_flash.begin() + idx, single_flash.begin() + idx + clip.w,
+							   buffers.flash_levels.begin() + idx);
 			}
 			thread_check = std::string("check threads identical ") + (same ? "yes" : "no") + " ("
 						   + std::to_string(params.threads) + " threads, " + std::to_string(bands) + " bands)";
@@ -3750,7 +4000,7 @@ void Shaded_light::finish_paint(Image_window8& win, bool full) {
 		}
 		check_shadows(clip);
 		check_weather(clip);
-		dump(win, static_cast<int>(dump_next), false, full);
+		dump(win, dump_number, false, full);
 		thread_check.clear();
 		shadow_info.clear();
 		weather_info.clear();
@@ -3764,8 +4014,8 @@ void Shaded_light::finish_paint(Image_window8& win, bool full) {
 			Shaded_cpu::resolve_view(buffers, params, clip, lut, frame);
 			break;
 		}
-		if (due) {
-			dump(win, static_cast<int>(dump_next), true, full);
+		if (checks) {
+			dump(win, dump_number, true, full);
 		}
 	}
 	if (due) {
@@ -3774,6 +4024,15 @@ void Shaded_light::finish_paint(Image_window8& win, bool full) {
 		if (timing) {
 			report_timing();
 		}
+	}
+	if (flash_dump) {
+		flash_dumps_left--;
+		flash_dumps_taken++;
+		unlit_frame.clear();
+	}
+	// A flash that ended before it was painted ends now it has been.
+	if (flash_on && flash_shown && flash_end_pending) {
+		end_flash();
 	}
 }
 
@@ -4149,6 +4408,13 @@ void Shaded_light::dump(Image_window8& win, int number, bool view, bool full) {
 			return Rgb{grey, grey, grey};
 		});
 	}
+	if (lit_active && params.flash > 0.0f) {
+		// Flash level: black in its shadows and away from it.
+		image("flash", [&](int idx) {
+			const int grey = std::min(buffers.flash_levels[idx] * 36, 255);
+			return Rgb{grey, grey, grey};
+		});
+	}
 	std::vector<unsigned char> grey(static_cast<size_t>(gw) * gh * 2);
 	for (int y = 0; y < gh; y++) {
 		for (int x = 0; x < gw; x++) {
@@ -4489,5 +4755,5 @@ void Shaded_light::report_timing() const {
 			  << " shadow_field_us=" << shadow_field_us / static_cast<double>(std::max(shadow_passes, 1LL))
 			  << " shadow_screen_us=" << shadow_screen_us / static_cast<double>(std::max(shadow_passes, 1LL))
 			  << " shadow_passes=" << shadow_passes << " shadow_cache_hits=" << shadow_cache_hits
-			  << " weather_prep_us=" << weather_prep_us << std::endl;
+			  << " weather_prep_us=" << weather_prep_us << " flash_us=" << flash_us << std::endl;
 }
