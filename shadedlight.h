@@ -189,6 +189,9 @@ struct alignas(16) Shaded_light_params {
 	float   fog_fade          = 3.0f;    // Tiles over which sky terms fade in at doorways.
 	float   fog_scatter       = 1.0f;
 	float   fog_mix           = 0.0f;
+	// Night tint: 0 = the game's own NIGHT colours, 0.5 = neutral grey, 1 = cool
+	// blue.  Only the unlit (ambient) colours change; lamp and fire light stays.
+	float   night_tint        = 0.0f;
 	int32_t fog               = 0;
 	float   avatar_x = 0.0f, avatar_y = 0.0f, avatar_z = 0.0f;
 	int32_t cloud_count = 0;
@@ -585,6 +588,10 @@ struct Shaded_ramp {
 constexpr int shaded_remap_size = shaded_light_levels * 256;
 // Last palette index the remap relights; 0xe0 on are the cycling colours.
 constexpr int shaded_last_lit_index = 0xdf;
+// Night tint weight: full at an ambient luminance (relative to DAY) of
+// night_y or below, none at dusk_y or above.
+constexpr float shaded_night_tint_night_y = 0.50f;
+constexpr float shaded_night_tint_dusk_y  = 0.72f;
 // The cycling ranges flames, embers and lava are drawn with (gamewin.cc
 // rotates 0xe8-0xef, 0xf8-0xfb and 0xfc-0xfe).  The night palettes turn
 // them green, and Exult only ever showed them through a light palette at
@@ -1179,6 +1186,7 @@ private:
 	int                                clock_palette      = -1;    // Last palnum filtered.
 	float                              ambient_y          = 0;     // Y of A, relative to DAY.
 	float                              remap_slider       = -1;    // params.ambient of the remap.
+	float                              remap_tint         = -1;    // params.night_tint of the remap.
 	std::string                        remap_game;
 	std::vector<unsigned char>         ambient_pal;    // 768: A.
 	std::vector<unsigned char>         displayed_pal;    // 768: B'.

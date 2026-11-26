@@ -1896,6 +1896,37 @@ int Shaded_cpu::nearest_colour_lab(const float (*pal_lab)[3], const float lab[3]
 	return best;
 }
 
+// How much of the night tint applies for an ambient palette of luminance y
+// (relative to DAY): full in the dark, none by dusk and dawn.
+static float Night_tint_weight(float y, float tint) {
+	if (tint <= 0.0f) {
+		return 0.0f;
+	}
+	const float dark = std::clamp((shaded_night_tint_dusk_y - y) / (shaded_night_tint_dusk_y - shaded_night_tint_night_y), 0.0f, 1.0f);
+	return std::min(tint, 1.0f) * dark;
+}
+
+// Colours i = 1..shaded_last_lit_index of in768 keep their luminance and lose
+// (weight 0.5) or turn blue (weight 1) in their chroma; the rest copy through.
+static void Apply_night_tint(const uint8_t* in768, float weight, uint8_t* out768) {
+	std::memcpy(out768, in768, 768);
+	// Cool blue gain per channel, scaled to keep luminance.
+	constexpr float gain_r = 0.75f, gain_g = 0.93f, gain_b = 1.35f;
+	constexpr float norm   = 0.299f * gain_r + 0.587f * gain_g + 0.114f * gain_b;
+	const float     to_grey = std::min(weight / 0.5f, 1.0f);
+	const float     to_blue = std::clamp((weight - 0.5f) / 0.5f, 0.0f, 1.0f);
+	const float     gains[3] = {gain_r / norm, gain_g / norm, gain_b / norm};
+	for (int i = 1; i <= shaded_last_lit_index; i++) {
+		const float rgb[3] = {static_cast<float>(in768[3 * i]), static_cast<float>(in768[3 * i + 1]), static_cast<float>(in768[3 * i + 2])};
+		const float y      = 0.299f * rgb[0] + 0.587f * rgb[1] + 0.114f * rgb[2];
+		for (int k = 0; k < 3; k++) {
+			const float grey = rgb[k] + (y - rgb[k]) * to_grey;
+			const float blue = grey * (1.0f + (gains[k] - 1.0f) * to_blue);
+			out768[3 * i + k] = static_cast<uint8_t>(std::clamp(std::lround(blue), 0L, 63L));
+		}
+	}
+}
+
 void Shaded_cpu::build_remap(
 		const uint8_t* ambient768, const uint8_t* const refs[4], Shaded_light_params& params, uint8_t* remap,
 		uint8_t* displayed768, Shaded_ramp* ramp) {
@@ -1912,7 +1943,18 @@ void Shaded_cpu::build_remap(
         stops.count++;
 	};
 	add_stop(Shaded_ramp::black, 0.0f, nullptr);
-	add_stop(Shaded_ramp::ambient, ambient, ambient768);
+	// The night tint recolours the ambient stop only (same luminance per
+	// colour), so lamp and fire light keep their own colours.
+	uint8_t tinted[768];
+	const uint8_t* ambient_colours = ambient768;
+	{
+		const float weight = Night_tint_weight(palette_luminance(ambient768, day), params.night_tint);
+		if (weight > 0.0f) {
+			Apply_night_tint(ambient768, weight, tinted);
+			ambient_colours = tinted;
+		}
+	}
+	add_stop(Shaded_ramp::ambient, ambient, ambient_colours);
 	std::pair<float, int> brighter[3];
 	int                   nbrighter = 0;
 	for (int k = 1; k < 4; k++) {
@@ -2084,6 +2126,8 @@ Shaded_light::Shaded_light()
 			value = *v != '0' ? 1 : 0;
 		}
 	};
+	env_percent("EXULT_SHADED_NIGHT_TINT", params.night_tint);
+	params.night_tint = std::min(params.night_tint, 1.0f);
 	env_switch("EXULT_SHADED_WEATHER", params.weather);
 	env_percent("EXULT_SHADED_CLOUD_SHADOWS", params.cloud_shadows);
 	params.cloud_shadows = std::min(params.cloud_shadows, 1.0f);
@@ -2210,6 +2254,7 @@ void Shaded_light::read_config() {
 	bool roof_seams;
 	config->value(base + "roof_seams", roof_seams, true);
 	params.roof_seams = roof_seams ? 1 : 0;
+	params.night_tint = std::min(percent("night_tint", 0), 1.0f);
 	// Weather.
 	bool weather;
 	config->value(base + "weather/enabled", weather, true);
@@ -3076,7 +3121,7 @@ bool Shaded_light::filter_palette(
 	const std::string key = Game_key();
 	const bool        same_ambient
 			= have_ambient && ambient_pal.size() == 768 && std::equal(in768, in768 + 768, ambient_pal.begin());
-	if (!same_ambient || remap_slider != params.ambient || remap_game != key) {
+	if (!same_ambient || remap_slider != params.ambient || remap_tint != params.night_tint || remap_game != key) {
 		if (!load_refs()) {
 			set_lit(false);
 			return false;
@@ -3094,6 +3139,7 @@ bool Shaded_light::filter_palette(
 		}
 		ambient_y    = Shaded_cpu::palette_luminance(ambient_pal.data(), refs[0]);
 		remap_slider = params.ambient;
+		remap_tint   = params.night_tint;
 		remap_game   = key;
 		if (lit_active) {    // The lit frame no longer matches.
 			need_full = true;
@@ -3812,6 +3858,7 @@ void Shaded_light::check_weather(const Shaded_rect& r) {
 		<< " reported) fog " << (in.fog ? "yes" : "no") << " rain " << (in.rain ? "yes" : "no") << " snow "
 		<< (in.snow ? "yes" : "no") << " flash " << (params.flash > 0.0f ? flash_count : 0) << " overcast "
 		<< params.overcast << "\n"
+		<< "night_tint " << params.night_tint << " ambient_y " << ambient_y << "\n"
 		<< "weather cloud_shadows " << params.cloud_shadows << " cloud_softness " << params.cloud_softness
 		<< " overcast_soften " << params.overcast_soften << " fade " << params.fog_fade << " shadow strength "
 		<< params.shadow_strength << " softness " << params.shadow_softness << " (config " << shadow_strength_config
