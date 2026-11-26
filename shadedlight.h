@@ -38,6 +38,7 @@
 #include "shapeid.h"
 
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <functional>
 #include <iosfwd>
@@ -78,6 +79,7 @@ enum class Shaded_view : int32_t {
 	light,     // Light level as a grey ramp.
 	unlit,     // The frame without the light pass.
 	shadow,    // Shadowed share of the light as a grey ramp.
+	normals,    // Surface normal as false colour (x, y, z to red, green, blue).
 	count
 };
 
@@ -89,11 +91,18 @@ enum class Shaded_backend : int32_t {
 	gpu = 1    // Not built yet (needs the SDL GPU device); falls back to CPU.
 };
 
-// How an object's pixels get their geometry.
+// How an object's pixels get their geometry: the object's 3D box, or a
+// rounded volume fitted to the box and the art's silhouette.  The values
+// are the kind column of the volumes section of shaded_light.txt.
 enum class Shaded_volume : uint8_t {
-	box,       // The object's 3D box (Shape_info dimensions).
-	rounded    // People, trees and so on; a later stage.  Treated as box now.
+	box     = 0,    // The 3D box (Shape_info dimensions).
+	figure  = 1,    // Vertical capsule: people, monsters.
+	round   = 2,    // Ellipsoid: bushes, rocks.
+	upright = 3,    // Cylinder with a rounded top: barrels, pillars.
+	tree    = 4     // Trunk capsule under a crown ellipsoid.
 };
+
+constexpr int shaded_volume_kinds = 5;
 
 /*
  *  All tunables, in vec4-sized groups of plain 32-bit values (std140).
@@ -146,6 +155,12 @@ struct alignas(16) Shaded_light_params {
 	float   shadow_softness   = 1.0f;     // 1 = light size 0.5 tile, 0 = hard edges.
 	float   shadow_bias       = 0.25f;    // Tiles skipped at the receiver.
 	float   shadow_reserved   = 0.0f;
+	// Rounded volumes.  rounded = 0 gives every object its box, exactly as
+	// before they were added; roof_seams only applies while rounded is on.
+	int32_t rounded          = 1;
+	int32_t roof_seams       = 1;
+	float   rounded_profile  = 1.0f;    // Reserved: bulge profile scale.
+	float   rounded_reserved = 0.0f;
 };
 
 static_assert(sizeof(Shaded_light_params) % 16 == 0);
@@ -161,6 +176,29 @@ struct Shaded_object_record {
 };
 
 static_assert(sizeof(Shaded_object_record) == 32);
+
+/*
+ *  The rounded volume fitted to one painted object, for the shadow trace;
+ *  one per object record (std430).  kind 0 (box): the record's box is used
+ *  and the rest is 0.  Otherwise an ellipsoid at centre with radius (the
+ *  crown for a tree), and for a tree also a vertical trunk capsule of
+ *  trunk_radius under the same x, y, from the ground up to trunk_top.
+ */
+struct Shaded_object_volume {
+	float   centre[3]    = {0.0f, 0.0f, 0.0f};    // World tiles, tiles, lifts.
+	float   radius[3]    = {0.0f, 0.0f, 0.0f};    // Tiles (z radius in tiles too).
+	float   trunk_radius = 0.0f;                  // Tiles; 0 = none.
+	float   trunk_top    = 0.0f;                  // Lifts.
+	int32_t kind         = 0;                     // Shaded_volume.
+	int32_t pad[3]       = {0, 0, 0};
+};
+
+static_assert(sizeof(Shaded_object_volume) == 48);
+static_assert(std::is_trivially_copyable_v<Shaded_object_volume> && std::is_standard_layout_v<Shaded_object_volume>);
+
+// Object flags (Shaded_scene_buffers::object_flags).
+constexpr uint8_t shaded_object_rounded = 1;    // Has a rounded volume.
+constexpr uint8_t shaded_object_roof    = 2;    // A roof slab (occludes, or a grid roof shape).
 
 // Light flags (Shaded_light_record::flags).  Area and off are also the
 // flags column of shaded_light.txt.
@@ -271,8 +309,13 @@ struct Shaded_scene_buffers {
 	std::vector<uint16_t>             object_ids;    // shaded_id_*.
 	std::vector<uint8_t>              light_levels;    // 0..level_count - 1.
 	std::vector<uint8_t>              shadow_levels;    // 255 * shadowed / unshadowed light.
+	// Octahedral unit normal (Shaded_encode_normal), where facing is
+	// shaded_face_rounded; 0 elsewhere.  GPU format RG8_SNORM.
+	std::vector<uint16_t>             normal_map;
 	std::vector<Shaded_object_record> objects;
 	std::vector<uint8_t>              object_opacity;    // Per object: screen-space shadow opacity.
+	std::vector<Shaded_object_volume> object_volumes;    // Per object: fitted rounded volume.
+	std::vector<uint8_t>              object_flags;      // Per object: shaded_object_*.
 	// Light bins: the lights reaching bin b are
 	// bin_lights[bin_offsets[b] .. bin_offsets[b + 1]).
 	std::vector<uint32_t> bin_offsets;
@@ -370,6 +413,121 @@ constexpr bool Shaded_faces_light(uint8_t facing, float dx, float dy, float dz) 
 	return static_cast<float>(n.x) * dx + static_cast<float>(n.y) * dy + static_cast<float>(n.z) * dz > 0.0f;
 }
 
+// Square root usable in constant expressions (Newton's method there,
+// std::sqrt at run time).
+constexpr float Shaded_sqrt(float x) {
+	if (__builtin_is_constant_evaluated()) {
+		if (x <= 0.0f) {
+			return 0.0f;
+		}
+		float r = x > 1.0f ? x : 1.0f;
+		for (int i = 0; i < 40; i++) {
+			r = 0.5f * (r + x / r);
+		}
+		return r;
+	}
+	return std::sqrt(x);
+}
+
+/*
+ *  Compact unit normals (Shaded_scene_buffers::normal_map): octahedral,
+ *  low byte x and high byte y, each a signed byte read as value / 127
+ *  (GPU RG8_SNORM).  Decode: n = (x, y, 1 - |x| - |y|); if n.z < 0, then
+ *  (x, y) = ((1 - |y|) * sign(x), (1 - |x|) * sign(y)); normalise.
+ */
+constexpr int8_t Shaded_snorm8(float v) {
+	const float c = v < -1.0f ? -1.0f : (v > 1.0f ? 1.0f : v);
+	const float s = c * 127.0f;
+	return static_cast<int8_t>(s < 0.0f ? s - 0.5f : s + 0.5f);
+}
+
+constexpr uint16_t Shaded_encode_normal(float x, float y, float z) {
+	const float ax  = x < 0.0f ? -x : x;
+	const float ay  = y < 0.0f ? -y : y;
+	const float az  = z < 0.0f ? -z : z;
+	const float sum = ax + ay + az;
+	if (sum <= 0.0f) {
+		return Shaded_encode_normal(0.0f, 0.0f, 1.0f);
+	}
+	float px = x / sum;
+	float py = y / sum;
+	if (z < 0.0f) {
+		const float qx = (1.0f - (py < 0.0f ? -py : py)) * (px < 0.0f ? -1.0f : 1.0f);
+		const float qy = (1.0f - (px < 0.0f ? -px : px)) * (py < 0.0f ? -1.0f : 1.0f);
+		px             = qx;
+		py             = qy;
+	}
+	const auto lo = static_cast<uint8_t>(Shaded_snorm8(px));
+	const auto hi = static_cast<uint8_t>(Shaded_snorm8(py));
+	return static_cast<uint16_t>(lo | (hi << 8));
+}
+
+/*
+ *  A surface normal in world axes (x east, y south, z up), unit length.
+ */
+struct Shaded_normalf {
+	float x, y, z;
+};
+
+constexpr Shaded_normalf Shaded_decode_normal(uint16_t code) {
+	const float x  = static_cast<float>(static_cast<int8_t>(code & 0xff)) / 127.0f;
+	const float y  = static_cast<float>(static_cast<int8_t>(code >> 8)) / 127.0f;
+	const float ax = x < 0.0f ? -x : x;
+	const float ay = y < 0.0f ? -y : y;
+	float       nx = x;
+	float       ny = y;
+	const float nz = 1.0f - ax - ay;
+	if (nz < 0.0f) {
+		nx = (1.0f - ay) * (x < 0.0f ? -1.0f : 1.0f);
+		ny = (1.0f - ax) * (y < 0.0f ? -1.0f : 1.0f);
+	}
+	const float len = Shaded_sqrt(nx * nx + ny * ny + nz * nz);
+	if (len <= 0.0f) {
+		return Shaded_normalf{0.0f, 0.0f, 1.0f};
+	}
+	return Shaded_normalf{nx / len, ny / len, nz / len};
+}
+
+/*
+ *  Signed distance in tiles (negative inside) from q to a fitted rounded
+ *  volume, q relative to v.centre with its z already in tiles: iq's
+ *  ellipsoid bound k0 * (k0 - 1) / k1, and for a tree the nearer of that
+ *  crown and the trunk capsule.
+ */
+constexpr float Shaded_rounded_sd(const float q[3], const Shaded_object_volume& v, float tiles_per_lift) {
+	float k0 = 0.0f;
+	float k1 = 0.0f;
+	float rmin = 1e30f;
+	for (int i = 0; i < 3; i++) {
+		const float r = v.radius[i] > 1.0f / 64.0f ? v.radius[i] : 1.0f / 64.0f;
+		k0 += (q[i] / r) * (q[i] / r);
+		k1 += (q[i] / (r * r)) * (q[i] / (r * r));
+		rmin = r < rmin ? r : rmin;
+	}
+	k0             = Shaded_sqrt(k0);
+	k1             = Shaded_sqrt(k1);
+	float sd       = k1 > 1e-9f ? k0 * (k0 - 1.0f) / k1 : -rmin;
+	if (v.kind == static_cast<int32_t>(Shaded_volume::tree) && v.trunk_radius > 0.0f) {
+		// Trunk: the vertical axis through the centre, up to trunk_top.
+		const float top   = (v.trunk_top - v.centre[2]) * tiles_per_lift;
+		const float above = q[2] > top ? q[2] - top : 0.0f;
+		const float trunk = Shaded_sqrt(q[0] * q[0] + q[1] * q[1] + above * above) - v.trunk_radius;
+		sd                = trunk < sd ? trunk : sd;
+	}
+	return sd;
+}
+
+// The normal the lighting uses at buffer index idx with face face (the
+// facing value masked): the stored normal for rounded pixels, else the
+// face's (0/1 valued, so box faces light exactly as with integers).
+inline Shaded_normalf Shaded_pixel_normal(const Shaded_scene_buffers& buf, int idx, uint8_t face) {
+	if (face == shaded_face_rounded) {
+		return Shaded_decode_normal(buf.normal_map[idx]);
+	}
+	const Shaded_normal n = Shaded_face_normal(face);
+	return Shaded_normalf{static_cast<float>(n.x), static_cast<float>(n.y), static_cast<float>(n.z)};
+}
+
 /*
  *  Colour ramp of the remap tables: the palettes it passes through, each at
  *  its light level (0 = black, 1 = DAY).
@@ -414,6 +572,57 @@ struct Shaded_object_context {
 	int           base_height = 0;    // Box bottom, in height units.
 	uint16_t      id          = shaded_id_none;
 	Shaded_volume volume      = Shaded_volume::box;
+	// Rounded volumes: the vertical axis through the footprint centre, at
+	// the box bottom, in pixels from (ox, oy).
+	float ax_px = 0.0f, ay_px = 0.0f;
+};
+
+/*
+ *  Where a rounded volume's pixels lie, in world pixels from the axis at
+ *  the box bottom (a east, b south, z up), for fitting its shadow volume.
+ *  Body is everything but a tree's crown.
+ */
+struct Shaded_rounded_extent {
+	struct Range {
+		float lo[3] = {1e30f, 1e30f, 1e30f};
+		float hi[3] = {-1e30f, -1e30f, -1e30f};
+
+		bool empty() const {
+			return lo[0] > hi[0];
+		}
+
+		void add(float a, float b, float z) {
+			const float p[3] = {a, b, z};
+			for (int i = 0; i < 3; i++) {
+				lo[i] = p[i] < lo[i] ? p[i] : lo[i];
+				hi[i] = p[i] > hi[i] ? p[i] : hi[i];
+			}
+		}
+
+		void add(const Range& r, float da, float db) {
+			if (!r.empty()) {
+				add(r.lo[0] + da, r.lo[1] + db, r.lo[2]);
+				add(r.hi[0] + da, r.hi[1] + db, r.hi[2]);
+			}
+		}
+	};
+
+	Range body;
+	Range crown;
+	float trunk_radius = 0.0f;    // Pixels; trees.
+};
+
+/*
+ *  A rounded volume's geometry for one frame, as offsets from the art's
+ *  top-left pixel (mask pixel (x, y) is screen pixel (xoff - xleft + x,
+ *  yoff - yabove + y)): per opaque pixel its height above the box bottom
+ *  (height units) and its normal; z_units 0xffff = not part of the art.
+ */
+struct Shaded_silhouette {
+	int                   xleft = 0, yabove = 0, w = 0, h = 0;
+	std::vector<uint16_t> z_units;
+	std::vector<uint16_t> normal;
+	Shaded_rounded_extent extent;    // Relative to the axis of the shape's own origin.
 };
 
 /*
@@ -607,6 +816,25 @@ namespace Shaded_cpu {
 	void record_spans(
 			Shaded_scene_buffers& buf, const Shaded_rect& clip, const Shaded_object_context& obj, const unsigned char* rle,
 			int xoff, int yoff, int skip_from);
+	// The rounded geometry of an RLE frame (xleft, yabove, w x h) painted
+	// for a kind != box volume of an xpx x ypx box whose axis is at (axu,
+	// axv) pixels from the shape's origin: its silhouette (pixels in
+	// [skip_from, 0xfe] left out) is given a bulge from a 3-4 chamfer
+	// distance transform, which gives each pixel a depth towards the viewer
+	// and so a height and a normal (rounded-report.md).
+	void build_silhouette(
+			const unsigned char* rle, int xleft, int yabove, int w, int h, int skip_from, Shaded_volume kind, int xpx,
+			int ypx, float axu, float axv, Shaded_silhouette& out);
+	// Record an RLE shape as record_spans does, with the heights and
+	// normals of its silhouette (facing shaded_face_rounded).  Adds the
+	// pixels written to written.
+	void record_rounded(
+			Shaded_scene_buffers& buf, const Shaded_rect& clip, const Shaded_object_context& obj,
+			const Shaded_silhouette& sil, const unsigned char* rle, int xoff, int yoff, int skip_from, long& written);
+	// Merge the thin south and east strips between stacked roof slabs
+	// whose tops meet at one height into those tops (facing top, the slab's
+	// top height), over r; reads outside r too.  Adds the pixels changed.
+	void merge_roof_seams(Shaded_scene_buffers& buf, const Shaded_rect& r, long& merged);
 	// Overwrite a rectangle of an 8-bit frame (indexed like the buffers) with
 	// the debug view; lut maps a false colour code to a palette index.
 	void resolve_view(
@@ -700,10 +928,6 @@ constexpr int shaded_shadow_parts_screen = 1;
 constexpr int shaded_shadow_parts_grid   = 2;
 
 class Shaded_workers;
-
-// Which volume an object uses.  Box for everything in stage 1; people,
-// trees and other organic shapes become rounded in a later stage.
-Shaded_volume Shaded_volume_for(const Game_object& obj);
 
 /*
  *  The scene recorder.  One instance (get()); recording() is non-null only
@@ -819,6 +1043,35 @@ private:
 	std::string                                       table_game;    // Game and mod it was read for.
 	bool                                              table_loaded = false;
 	int                                               table_radius = 0;    // Largest radius, tiles.
+	// The volumes section, keyed by (shape, frame or -1): Shaded_volume.
+	std::map<std::pair<int, int>, uint8_t> volume_table;
+	// Rounded silhouettes by frame, skip value, kind, box and offset of the
+	// shape from the box origin; cleared with the game or when large.
+	struct Silhouette_key {
+		const void* frame;
+		int         skip_from, kind, xtiles, ytiles, du, dv;
+
+		bool operator==(const Silhouette_key& o) const {
+			return frame == o.frame && skip_from == o.skip_from && kind == o.kind && xtiles == o.xtiles && ytiles == o.ytiles
+				   && du == o.du && dv == o.dv;
+		}
+	};
+
+	struct Silhouette_hash {
+		size_t operator()(const Silhouette_key& k) const {
+			size_t h = std::hash<const void*>()(k.frame);
+			for (const int v : {k.skip_from, k.kind, k.xtiles, k.ytiles, k.du, k.dv}) {
+				h = h * 1000003u ^ std::hash<int>()(v);
+			}
+			return h;
+		}
+	};
+
+	std::unordered_map<Silhouette_key, Shaded_silhouette, Silhouette_hash> silhouettes;
+	Shaded_rounded_extent              object_extent;     // Of the object being painted.
+	std::vector<Shaded_rounded_extent> object_extents;    // Per object record, for the dump check.
+	long                  rounded_pixels = 0;    // Written this paint.
+	long                  seam_pixels    = 0;    // Merged this paint.
 	// Lights of the current paint: the object lit by each (the bearer for
 	// carried lights), the light object itself and where its row came from.
 	std::vector<Shaded_light_record> lights;
@@ -845,7 +1098,7 @@ private:
 	std::vector<std::vector<uint8_t>>  ref_pals;    // shaded_ref_palettes, 768 each.
 	std::string                        refs_game;    // Game the refs were read for.
 	uint64_t                           lit_hash    = 0;    // Light hash of the last lit paint.
-	float                              lit_sliders[9]{};    // Sliders of the last lit paint.
+	float                              lit_sliders[11]{};    // Sliders of the last lit paint.
 	int                                lit_grid    = -1;    // Grid generation of the last lit paint.
 	std::vector<unsigned char>         unlit_frame;    // Frame before the pass, for dumps.
 	long                               relit_pixels = 0;
@@ -927,6 +1180,8 @@ private:
 	void               read_config();
 	void               run_debug_hooks();
 	void               load_table();
+	Shaded_volume      volume_for(const Game_object& obj) const;
+	const Shaded_silhouette& silhouette_for(Shape_frame& shape, int xoff, int yoff, int skip_from);
 	Shaded_light_entry find_row(int shape, int frame, int brightness, Shaded_light_row& row) const;
 	void               gather_lights();
 	void               add_light(

@@ -144,6 +144,51 @@ static_assert(Shaded_cone_visibility(0.5f, 0.5f, false) == 1.0f && Shaded_cone_v
 static_assert(Shaded_cone_visibility(0.03125f, 0.0f, false) == 0.75f);    // Cone at least 1/16.
 static_assert(Shaded_cone_visibility(0.01f, 0.5f, true) == 1.0f && Shaded_cone_visibility(-0.01f, 0.5f, true) == 0.0f);
 namespace {
+	// Octahedral normals round-trip within 2/127 per component.
+	constexpr bool Normal_round_trip(float x, float y, float z) {
+		const float          len = Shaded_sqrt(x * x + y * y + z * z);
+		const Shaded_normalf n   = Shaded_decode_normal(Shaded_encode_normal(x / len, y / len, z / len));
+		auto                 off = [](float a, float b) {
+			return (a > b ? a - b : b - a) > 2.0f / 127.0f;
+		};
+		return !off(n.x, x / len) && !off(n.y, y / len) && !off(n.z, z / len);
+	}
+
+	constexpr Shaded_object_volume vol_bush{
+			{10.0f, 10.0f, 1.0f},
+			{1.0f, 1.5f, 0.5f},
+			0.0f, 0.0f, static_cast<int32_t>(Shaded_volume::round), {0, 0, 0}
+	};
+	constexpr Shaded_object_volume vol_tree{
+			{10.0f, 10.0f, 12.0f},
+			{2.0f, 2.0f, 2.0f},
+			0.25f, 12.0f, static_cast<int32_t>(Shaded_volume::tree), {0, 0, 0}
+	};
+	constexpr float q_centre[3] = {0.0f, 0.0f, 0.0f};
+	constexpr float q_beyond[3] = {2.0f, 0.0f, 0.0f};    // 1 tile past the x radius.
+	constexpr float q_trunk[3]  = {0.1f, 0.0f, -4.0f};    // Under the crown, in the trunk.
+	constexpr float q_beside[3] = {1.0f, 0.0f, -4.0f};    // Beside the trunk.
+
+	constexpr bool Near(float a, float b, float e) {
+		return (a > b ? a - b : b - a) <= e;
+	}
+}    // namespace
+
+static_assert(Shaded_sqrt(16.0f) == 4.0f && Near(Shaded_sqrt(2.0f), 1.41421356f, 1e-6f));
+static_assert(Normal_round_trip(0.0f, 0.0f, 1.0f));     // Up.
+static_assert(Normal_round_trip(0.0f, 1.0f, 0.0f));     // South.
+static_assert(Normal_round_trip(1.0f, 0.0f, 0.0f));     // East.
+static_assert(Normal_round_trip(0.3f, -0.5f, -0.2f));    // Below the horizon.
+static_assert(Normal_round_trip(-0.6f, 0.6f, 0.5f));
+static_assert(Shaded_encode_normal(0.0f, 0.0f, 1.0f) == 0);    // Up is 0, as are box pixels.
+// Rounded shadow volumes: inside is negative, a tile out about +1, and a
+// tree's trunk is solid under its crown.
+static_assert(Shaded_rounded_sd(q_centre, vol_bush, 0.5f) < 0.0f);
+static_assert(Near(Shaded_rounded_sd(q_beyond, vol_bush, 0.5f), 1.0f, 0.1f));
+static_assert(Shaded_rounded_sd(q_trunk, vol_tree, 0.5f) < 0.0f);
+static_assert(Near(Shaded_rounded_sd(q_beside, vol_tree, 0.5f), 0.75f, 0.01f));
+
+namespace {
 	constexpr uint8_t field_clear[8] = {254, 254, 254, 254, 254, 254, 254, 254};
 	constexpr uint8_t field_solid[8] = {255, 255, 255, 255, 255, 255, 255, 255};
 	constexpr uint8_t field_wall[8]  = {255, 0, 255, 0, 255, 0, 255, 0};      // Solid at x, dark at x + 1.
@@ -325,13 +370,9 @@ namespace {
 	}
 
 	// Face and height of one pixel of an object; (u, v) from its origin.
+	// Rounded volumes are recorded by record_rounded; their non-RLE frames
+	// and every box object come here.
 	inline Shaded_box_hit Classify(const Shaded_object_context& obj, int u, int v) {
-		switch (obj.volume) {
-		case Shaded_volume::rounded:
-			// Later stage: a rounded volume inside the box.  Box for now.
-		case Shaded_volume::box:
-			break;
-		}
 		return Shaded_classify_box(u, v, obj.xpx, obj.ypx, obj.hpx);
 	}
 
@@ -385,6 +426,34 @@ namespace {
 
 	public:
 		explicit Shaded_light_reader(Light_table& t) : Base_reader(false), table(t) {}
+	};
+
+	using Volume_table = std::map<std::pair<int, int>, uint8_t>;
+
+	/*
+	 *  Reads the volumes section of shaded_light.txt:
+	 *      shape/frame/kind
+	 *  Patch rows replace static rows with the same shape and frame.
+	 */
+	class Shaded_volume_reader final : public Base_reader {
+		Volume_table& table;
+
+	protected:
+		void read_data(std::istream& in, size_t index, int version, bool patch, Exult_Game game, bool binary) override {
+			ignore_unused_variable_warning(index, version, patch, game, binary);
+			const int shape = ReadInt(in, -1);
+			int       frame = ReadInt(in, -1);
+			const int kind  = ReadInt(in, -1);
+			if (shape < 0 || kind < 0) {
+				return;
+			}
+			frame = frame < 0 ? -1 : (frame & 31);
+
+			table[std::make_pair(shape, frame)] = static_cast<uint8_t>(std::min(kind, shaded_volume_kinds - 1));
+		}
+
+	public:
+		explicit Shaded_volume_reader(Volume_table& t) : Base_reader(false), table(t) {}
 	};
 
 	// FNV-1a over 32-bit values.
@@ -563,6 +632,256 @@ void Shaded_cpu::record_spans(
 	}
 }
 
+namespace {
+	// Visit the pixels of an RLE frame painted at (xoff, yoff), as
+	// Image_buffer8::paint_rle reads it: visit(x, y, value) per pixel.
+	template <typename Visit>
+	void For_rle_pixels(const unsigned char* rle, int xoff, int yoff, Visit&& visit) {
+		const uint8* in = rle;
+		int          scanlen;
+		while ((scanlen = little_endian::Read2(in)) != 0) {
+			const int encoded = scanlen & 1;
+			scanlen           = scanlen >> 1;
+			const int scanx   = xoff + static_cast<sint16>(little_endian::Read2(in));
+			const int scany   = yoff + static_cast<sint16>(little_endian::Read2(in));
+			if (!encoded) {
+				for (int i = 0; i < scanlen; i++) {
+					visit(scanx + i, scany, static_cast<int>(in[i]));
+				}
+				in += scanlen;
+				continue;
+			}
+			for (int b = 0; b < scanlen;) {
+				unsigned char bcnt   = Read1(in);
+				const int     repeat = bcnt & 1;
+				bcnt                 = bcnt >> 1;
+				if (repeat) {
+					const int pixv = Read1(in);
+					for (int i = 0; i < bcnt; i++) {
+						visit(scanx + b + i, scany, pixv);
+					}
+				} else {
+					for (int i = 0; i < bcnt; i++) {
+						visit(scanx + b + i, scany, static_cast<int>(in[i]));
+					}
+					in += bcnt;
+				}
+				b += bcnt;
+			}
+		}
+	}
+
+	// 3-4 chamfer distance transform in place: inside cells (non-zero on
+	// entry) get 3 x their distance in pixels to the nearest outside cell;
+	// cells beyond the grid are outside.
+	void Chamfer_distance(std::vector<int>& d, int w, int h) {
+		auto at = [&](int x, int y) {
+			return (x < 0 || y < 0 || x >= w || y >= h) ? 0 : d[static_cast<size_t>(y) * w + x];
+		};
+		for (int y = 0; y < h; y++) {
+			for (int x = 0; x < w; x++) {
+				int& v = d[static_cast<size_t>(y) * w + x];
+				if (v != 0) {
+					v = std::min({v, at(x - 1, y) + 3, at(x, y - 1) + 3, at(x - 1, y - 1) + 4, at(x + 1, y - 1) + 4});
+				}
+			}
+		}
+		for (int y = h - 1; y >= 0; y--) {
+			for (int x = w - 1; x >= 0; x--) {
+				int& v = d[static_cast<size_t>(y) * w + x];
+				if (v != 0) {
+					v = std::min({v, at(x + 1, y) + 3, at(x, y + 1) + 3, at(x + 1, y + 1) + 4, at(x - 1, y + 1) + 4});
+				}
+			}
+		}
+	}
+}    // namespace
+
+void Shaded_cpu::build_silhouette(
+		const unsigned char* rle, int xleft, int yabove, int w, int h, int skip_from, Shaded_volume kind, int xpx, int ypx,
+		float axu, float axv, Shaded_silhouette& out) {
+	out        = Shaded_silhouette{};
+	out.xleft  = xleft;
+	out.yabove = yabove;
+	out.w      = std::max(w, 0);
+	out.h      = std::max(h, 0);
+	const auto size = static_cast<size_t>(out.w) * out.h;
+	out.z_units.assign(size, 0xffff);
+	out.normal.assign(size, 0);
+	if (size == 0) {
+		return;
+	}
+	// The opaque pixels, with the same skip rule as record_spans.
+	std::vector<uint8_t> mask(size, 0);
+	int                  top = h, bottom = -1;
+	For_rle_pixels(rle, xleft, yabove, [&](int x, int y, int val) {
+		if (x < 0 || y < 0 || x >= w || y >= h || (val >= skip_from && val <= 0xfe)) {
+			return;
+		}
+		mask[static_cast<size_t>(y) * w + x] = 1;
+		top                                  = std::min(top, y);
+		bottom                               = std::max(bottom, y);
+	});
+	if (bottom < 0) {
+		return;
+	}
+	auto opaque = [&](int x, int y) {
+		return x >= 0 && y >= 0 && x < w && y < h && mask[static_cast<size_t>(y) * w + x] != 0;
+	};
+	// A tree's crown is the top 60 % of its rows; the rest is its trunk.
+	const bool tree  = kind == Shaded_volume::tree;
+	const int  split = tree ? top + (6 * (bottom - top + 1) + 9) / 10 : top;
+	// Grids pad rows above and below the art: a column whose art reaches
+	// the bottom row goes on down (feet and trunks stand on the ground, so
+	// they get no bottom edge), and a trunk goes on up into its crown.
+	constexpr int pad   = 32;
+	const int     gh    = h + 2 * pad;
+	const auto    gsize = static_cast<size_t>(w) * gh;
+	std::vector<uint8_t> grounded(static_cast<size_t>(w), 0);
+	for (int x = 0; x < w; x++) {
+		grounded[static_cast<size_t>(x)] = opaque(x, bottom) ? 1 : 0;
+	}
+	// One part (body or crown): its distance grid as depths towards the
+	// viewer, w = Rw * sqrt(1 - (1 - min(d / R, 1))^2).
+	struct Part {
+		std::vector<float> depth;
+		float              r = 2.0f;    // Pixels: the part's largest inner radius, clamped.
+	};
+
+	auto make_part = [&](auto&& inside, float min_rw, int dmax_from) {
+		Part             part;
+		std::vector<int> d(gsize, 0);
+		for (int gy = 0; gy < gh; gy++) {
+			for (int x = 0; x < w; x++) {
+				d[static_cast<size_t>(gy) * w + x] = inside(x, gy - pad) ? 1 << 28 : 0;
+			}
+		}
+		Chamfer_distance(d, w, gh);
+		int dmax = 0;
+		for (int y = std::max(dmax_from, 0); y < h; y++) {
+			for (int x = 0; x < w; x++) {
+				if (inside(x, y) && opaque(x, y)) {
+					dmax = std::max(dmax, d[static_cast<size_t>(y + pad) * w + x]);
+				}
+			}
+		}
+		part.r         = std::clamp(static_cast<float>(dmax) / 3.0f, 2.0f, 32.0f);
+		const float rw = std::max(part.r, min_rw);
+		part.depth.assign(gsize, 0.0f);
+		for (size_t i = 0; i < gsize; i++) {
+			if (d[i] != 0) {
+				const float t = 1.0f - std::min(static_cast<float>(d[i]) / 3.0f / part.r, 1.0f);
+				part.depth[i] = rw * std::sqrt(std::max(1.0f - t * t, 0.0f));
+			}
+		}
+		return part;
+	};
+	const float box_rw = 0.5f * static_cast<float>(std::min(xpx, ypx));
+	// The body: everything but a tree's crown.
+	const Part body = make_part(
+			[&](int x, int y) {
+				if (y > bottom) {
+					return grounded[static_cast<size_t>(x)] != 0;
+				}
+				if (tree && y < split) {
+					return opaque(x, split);    // The trunk goes on up.
+				}
+				return opaque(x, y);
+			},
+			tree ? 0.0f : box_rw, tree ? bottom - (bottom - top + 1) / 5 : top);
+	Part crown;
+	if (tree) {
+		crown = make_part(
+				[&](int x, int y) {
+					return y < split && opaque(x, y);
+				},
+				box_rw, top);
+		out.extent.trunk_radius = body.r;
+	}
+	// Screen right and down, and the view direction, in world axes.
+	const float  inv6 = 1.0f / std::sqrt(6.0f);
+	const float  inv3 = 1.0f / std::sqrt(3.0f);
+	const float  rv[3] = {2.0f * inv6, -inv6, -inv6};
+	const float  dv3[3] = {-inv6, 2.0f * inv6, -inv6};
+	const float  view[3] = {inv3, inv3, inv3};
+	const float  root2   = std::sqrt(2.0f);
+	for (int y = top; y <= bottom; y++) {
+		for (int x = 0; x < w; x++) {
+			if (!opaque(x, y)) {
+				continue;
+			}
+			const bool  in_crown = tree && y < split;
+			const Part& part     = in_crown ? crown : body;
+			auto        depth    = [&](int px, int py) {
+                const int gy = py + pad;
+                return px < 0 || px >= w || gy < 0 || gy >= gh ? 0.0f : part.depth[static_cast<size_t>(gy) * w + px];
+			};
+			const float wd = depth(x, y);
+			// Height from the depth: the point wd towards the viewer (along
+			// (1, 1, 0)) that projects to this pixel.
+			const float du = static_cast<float>(x - xleft) - axu;
+			const float dv = static_cast<float>(y - yabove) - axv;
+			const float z  = std::max((root2 * wd - (du + dv)) * 0.5f, 0.0f);
+			const auto  i  = static_cast<size_t>(y) * w + x;
+			out.z_units[i] = static_cast<uint16_t>(std::min(std::lround(z * 4.0f), 0xfffeL));
+			(in_crown ? out.extent.crown : out.extent.body).add(du + z, dv + z, z);
+			// Normal from the depth's slope across the screen: in the middle
+			// it faces the viewer, at the silhouette's edge it turns sideways.
+			const float sx  = -(depth(x + 1, y) - depth(x - 1, y)) * 0.5f;
+			const float sy  = -(depth(x, y + 1) - depth(x, y - 1)) * 0.5f;
+			const float f   = 1.0f / std::sqrt(1.0f + sx * sx + sy * sy);
+			const float gx  = sx * f;
+			const float gy  = sy * f;
+			const float vz  = std::sqrt(std::max(1.0f - gx * gx - gy * gy, 0.0f));
+			float       n[3];
+			for (int k = 0; k < 3; k++) {
+				n[k] = view[k] * vz + rv[k] * gx + dv3[k] * gy;
+			}
+			// People, pillars and trunks stand upright: their sides face out
+			// more than up.
+			if (!in_crown && kind != Shaded_volume::round) {
+				n[2] *= 0.5f;
+			}
+			float len = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+			n[2]      = std::max(n[2] / len, -0.2f);
+			n[0] /= len;
+			n[1] /= len;
+			len           = std::sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+			out.normal[i] = Shaded_encode_normal(n[0] / len, n[1] / len, n[2] / len);
+		}
+	}
+}
+
+void Shaded_cpu::record_rounded(
+		Shaded_scene_buffers& buf, const Shaded_rect& clip, const Shaded_object_context& obj, const Shaded_silhouette& sil,
+		const unsigned char* rle, int xoff, int yoff, int skip_from, long& written) {
+	const int right  = clip.x + clip.w;
+	const int bottom = clip.y + clip.h;
+	const int mx0    = sil.xleft - xoff;    // Mask x of screen x 0.
+	const int my0    = sil.yabove - yoff;
+	For_rle_pixels(rle, xoff, yoff, [&](int x, int y, int val) {
+		if (x < clip.x || x >= right || y < clip.y || y >= bottom || (val >= skip_from && val <= 0xfe)) {
+			return;
+		}
+		const int mx = x + mx0;
+		const int my = y + my0;
+		if (mx < 0 || my < 0 || mx >= sil.w || my >= sil.h) {
+			return;
+		}
+		const auto     m  = static_cast<size_t>(my) * sil.w + mx;
+		const uint16_t zu = sil.z_units[m];
+		if (zu == 0xffff) {
+			return;
+		}
+		const int idx          = buf.index(x, y);
+		buf.height_map[idx]    = static_cast<uint16_t>(std::min(obj.base_height + zu, 0xffff));
+		buf.facing_map[idx]    = shaded_face_rounded;
+		buf.normal_map[idx]    = sil.normal[m];
+		buf.object_ids[idx]    = obj.id;
+		written++;
+	});
+}
+
 int Shaded_cpu::view_code(const Shaded_scene_buffers& buf, const Shaded_light_params& params, int index) {
 	const uint8_t facing = buf.facing_map[index];
 	switch (static_cast<Shaded_view>(params.view)) {
@@ -587,6 +906,7 @@ int Shaded_cpu::view_code(const Shaded_scene_buffers& buf, const Shaded_light_pa
 		return 1 + buf.light_levels[index] * (lut_size - 2) / std::max(params.level_count - 1, 1);
 	case Shaded_view::shadow:
 		return 1 + buf.shadow_levels[index] * (lut_size - 2) / 255;
+	case Shaded_view::normals:
 	case Shaded_view::normal:
 	case Shaded_view::unlit:
 	case Shaded_view::count:
@@ -1347,13 +1667,6 @@ void Shaded_cpu::resolve_view(
 	}
 }
 
-Shaded_volume Shaded_volume_for(const Game_object& obj) {
-	// Hook for the rounded-volume stage: people, trees and other organic
-	// shapes will return Shaded_volume::rounded.
-	ignore_unused_variable_warning(obj);
-	return Shaded_volume::box;
-}
-
 Shaded_light* Shaded_light::active = nullptr;
 
 Shaded_light& Shaded_light::get() {
@@ -1433,6 +1746,14 @@ Shaded_light::Shaded_light() {
 	if (const char* grid = std::getenv("EXULT_SHADED_SHADOW_GRID"); grid && *grid) {
 		shadow_grid_ray = std::string(grid) == "ray";
 	}
+	// Rounded volume overrides, for the twins (EXULT_SHADED_ROUNDED=0 is the
+	// box-only look of the stage 3 renderer).
+	if (const char* rnd = std::getenv("EXULT_SHADED_ROUNDED"); rnd && *rnd) {
+		params.rounded = *rnd != '0' ? 1 : 0;
+	}
+	if (const char* seams = std::getenv("EXULT_SHADED_ROOF_SEAMS"); seams && *seams) {
+		params.roof_seams = *seams != '0' ? 1 : 0;
+	}
 	const char* tim = std::getenv("EXULT_SHADED_TIMING");
 	timing          = tim && *tim && *tim != '0';
 	record_on       = enabled;
@@ -1477,6 +1798,8 @@ const char* Shaded_light::view_name(Shaded_view view) {
 		return "unlit";
 	case Shaded_view::shadow:
 		return "shadow";
+	case Shaded_view::normals:
+		return "normals";
 	case Shaded_view::normal:
 	case Shaded_view::count:
 		break;
@@ -1533,6 +1856,12 @@ void Shaded_light::read_config() {
 	int resolution;
 	config->value(base + "shadow_resolution", resolution, 2);
 	params.shadow_resolution = Shadow_resolution(resolution);
+	bool rounded;
+	config->value(base + "rounded", rounded, true);
+	params.rounded = rounded ? 1 : 0;
+	bool roof_seams;
+	config->value(base + "roof_seams", roof_seams, true);
+	params.roof_seams = roof_seams ? 1 : 0;
 }
 
 /*
@@ -1573,15 +1902,18 @@ void Shaded_light::load_table() {
 	}
 	table_loaded = true;
 	table_game   = key;
+	silhouettes.clear();    // Shape frames may be other ones now.
 	light_table.clear();
+	volume_table.clear();
 	int resource = -1;
 	if (game == BLACK_GATE) {
 		resource = EXULT_BG_FLX_SHADED_LIGHT_TXT;
 	} else if (game == SERPENT_ISLE) {
 		resource = EXULT_SI_FLX_SHADED_LIGHT_TXT;
 	}
-	std::array<std::string_view, 1> sections{"lights"};
-	std::array readers = make_unique_array<Base_reader>(std::make_unique<Shaded_light_reader>(light_table));
+	std::array<std::string_view, 2> sections{"lights", "volumes"};
+	std::array                      readers = make_unique_array<Base_reader>(
+            std::make_unique<Shaded_light_reader>(light_table), std::make_unique<Shaded_volume_reader>(volume_table));
 	static_assert(sections.size() == readers.size());
 	try {
 		Read_text_data_file("shaded_light", readers, sections, false, game, resource);
@@ -1593,6 +1925,29 @@ void Shaded_light::load_table() {
 		table_radius = std::max(table_radius, entry.radius);
 	}
 	std::cout << "SHADED: light table has " << light_table.size() << " rows" << std::endl;
+	std::cout << "SHADED: volume rows " << volume_table.size() << " (rounded " << (params.rounded ? "on" : "off")
+			  << ", roof seams " << (params.rounded && params.roof_seams ? "on" : "off") << ")" << std::endl;
+}
+
+/*
+ *  The volume an object's pixels get: its exact (shape, frame & 31) row,
+ *  then its (shape, -1) row, else figure for actors and box for the rest.
+ *  Always box with rounded volumes off.
+ */
+
+Shaded_volume Shaded_light::volume_for(const Game_object& obj) const {
+	if (!params.rounded) {
+		return Shaded_volume::box;
+	}
+	const int shape = obj.get_shapenum();
+	auto      it    = volume_table.find(std::make_pair(shape, obj.get_framenum() & 31));
+	if (it == volume_table.end()) {
+		it = volume_table.find(std::make_pair(shape, -1));
+	}
+	if (it != volume_table.end()) {
+		return static_cast<Shaded_volume>(it->second);
+	}
+	return obj.as_actor() ? Shaded_volume::figure : Shaded_volume::box;
 }
 
 /*
@@ -2015,8 +2370,12 @@ bool Shaded_light::setup_buffers(Image_window8& win) {
 		buffers.object_ids.assign(count, shaded_id_none);
 		buffers.light_levels.assign(count, 0);
 		buffers.shadow_levels.assign(count, 255);
+		buffers.normal_map.assign(count, 0);
 		buffers.objects.clear();
 		buffers.object_opacity.clear();
+		buffers.object_volumes.clear();
+		buffers.object_flags.clear();
+		object_extents.clear();
 		object_index.clear();
 		main_actor_id         = shaded_id_none;
 		need_full             = true;    // Nothing recorded outside this clip.
@@ -2033,6 +2392,8 @@ void Shaded_light::begin_paint(Image_window8& win, bool full) {
 		return;
 	}
 	paint_record_us = 0;
+	rounded_pixels  = 0;
+	seam_pixels     = 0;
 	// (Re)allocating the buffers is not part of the timed paint.
 	const bool ready = record_on && setup_buffers(win);
 	const Clock::time_point start = Clock::now();
@@ -2048,6 +2409,9 @@ void Shaded_light::begin_paint(Image_window8& win, bool full) {
 	if (full) {
 		buffers.objects.clear();
 		buffers.object_opacity.clear();
+		buffers.object_volumes.clear();
+		buffers.object_flags.clear();
+		object_extents.clear();
 		object_index.clear();
 		main_actor_id = shaded_id_none;
 		need_full     = false;
@@ -2103,6 +2467,7 @@ void Shaded_light::shift(int dx, int dy) {
 		std::copy_n(buffers.object_ids.begin() + from, w, buffers.object_ids.begin() + to);
 		std::copy_n(buffers.light_levels.begin() + from, w, buffers.light_levels.begin() + to);
 		std::copy_n(buffers.shadow_levels.begin() + from, w, buffers.shadow_levels.begin() + to);
+		std::copy_n(buffers.normal_map.begin() + from, w, buffers.normal_map.begin() + to);
 	};
 	const int rows = area.h - std::abs(dy);
 	if (dy > 0 || (dy == 0 && dx > 0)) {    // Moving up or left: go forwards.
@@ -2119,6 +2484,7 @@ void Shaded_light::shift(int dx, int dy) {
 		std::vector<uint16_t> i16(static_cast<size_t>(w));
 		std::vector<uint8_t>  l8(static_cast<size_t>(w));
 		std::vector<uint8_t>  s8(static_cast<size_t>(w));
+		std::vector<uint16_t> n16(static_cast<size_t>(w));
 		for (int r = 0; r < rows; r++) {
 			const int from = buffers.index(src_x, area.y + r);
 			const int to   = buffers.index(dst_x, area.y + r);
@@ -2127,11 +2493,13 @@ void Shaded_light::shift(int dx, int dy) {
 			std::copy_n(buffers.object_ids.begin() + from, w, i16.begin());
 			std::copy_n(buffers.light_levels.begin() + from, w, l8.begin());
 			std::copy_n(buffers.shadow_levels.begin() + from, w, s8.begin());
+			std::copy_n(buffers.normal_map.begin() + from, w, n16.begin());
 			std::copy(h16.begin(), h16.end(), buffers.height_map.begin() + to);
 			std::copy(f8.begin(), f8.end(), buffers.facing_map.begin() + to);
 			std::copy(i16.begin(), i16.end(), buffers.object_ids.begin() + to);
 			std::copy(l8.begin(), l8.end(), buffers.light_levels.begin() + to);
 			std::copy(s8.begin(), s8.end(), buffers.shadow_levels.begin() + to);
+			std::copy(n16.begin(), n16.end(), buffers.normal_map.begin() + to);
 		}
 	}
 }
@@ -2807,15 +3175,23 @@ void Shaded_light::begin_object(const Game_object& obj, int ox, int oy) {
 	const Tile_coord        t     = obj.get_tile();
 	const Shaded_object_record rec{
 			t.tx, t.ty, t.tz, info.get_3d_xtiles(frame), info.get_3d_ytiles(frame), info.get_3d_height(), obj.get_shapenum(), frame};
-	const uint8_t opacity = Screen_opacity(obj, info, frame);
-	auto [it, inserted]   = object_index.try_emplace(&obj, shaded_id_overflow);
+	const Shaded_volume volume  = volume_for(obj);
+	const uint8_t       opacity = Screen_opacity(obj, info, frame);
+	const uint8_t       flags   = volume != Shaded_volume::box ? shaded_object_rounded : 0;
+	auto [it, inserted]         = object_index.try_emplace(&obj, shaded_id_overflow);
 	if (inserted && buffers.objects.size() < shaded_id_overflow - 1) {
 		buffers.objects.push_back(rec);
 		buffers.object_opacity.push_back(opacity);
+		buffers.object_volumes.emplace_back();
+		buffers.object_flags.push_back(flags);
+		object_extents.emplace_back();
 		it->second = static_cast<uint16_t>(buffers.objects.size());
 	} else if (!inserted && it->second != shaded_id_overflow) {
 		buffers.objects[it->second - 1]        = rec;    // Moved or changed frame.
 		buffers.object_opacity[it->second - 1] = opacity;
+		buffers.object_volumes[it->second - 1] = Shaded_object_volume{};
+		buffers.object_flags[it->second - 1]   = flags;
+		object_extents[it->second - 1]         = Shaded_rounded_extent{};
 	}
 	object.ox          = ox;
 	object.oy          = oy;
@@ -2824,7 +3200,10 @@ void Shaded_light::begin_object(const Game_object& obj, int ox, int oy) {
 	object.hpx         = rec.ztiles * (c_tilesize / 2);
 	object.base_height = rec.tz * shaded_height_units_per_lift;
 	object.id          = it->second;
-	object.volume      = Shaded_volume_for(obj);
+	object.volume      = volume;
+	object.ax_px       = 0.5f - 0.5f * static_cast<float>(object.xpx);
+	object.ay_px       = 0.5f - 0.5f * static_cast<float>(object.ypx);
+	object_extent      = Shaded_rounded_extent{};
 	if (&obj == Game_window::get_instance()->get_main_actor()) {
 		main_actor_id = object.id;
 	}
@@ -2838,6 +3217,57 @@ void Shaded_light::begin_object(const Game_object& obj, int ox, int oy) {
 void Shaded_light::end_object() {
 	Shape_manager::get_instance()->set_paint_listener(nullptr);
 	in_object = false;
+	if (object.volume == Shaded_volume::box || object.id == shaded_id_none || object.id == shaded_id_overflow
+		|| object.id > buffers.objects.size()) {
+		return;
+	}
+	// The shadow volume: an ellipsoid over the pixels' extent (a tree's
+	// crown), and for a tree the trunk capsule under it.
+	const Shaded_object_record& o   = buffers.objects[object.id - 1];
+	const Shaded_rounded_extent& e  = object_extent;
+	Shaded_object_volume         v;
+	const Shaded_rounded_extent::Range& main = object.volume == Shaded_volume::tree && !e.crown.empty() ? e.crown : e.body;
+	object_extents[object.id - 1]            = e;
+	if (main.empty()) {
+		buffers.object_volumes[object.id - 1] = v;    // Nothing rounded painted: its box.
+		return;
+	}
+	const float tile = static_cast<float>(c_tilesize);
+	const float lift = tile / 2.0f;    // Pixels per lift.
+	v.centre[0]      = static_cast<float>(o.tx + 1) - 0.5f * static_cast<float>(o.xtiles) + 0.5f * (main.lo[0] + main.hi[0]) / tile;
+	v.centre[1]      = static_cast<float>(o.ty + 1) - 0.5f * static_cast<float>(o.ytiles) + 0.5f * (main.lo[1] + main.hi[1]) / tile;
+	v.centre[2]      = static_cast<float>(o.tz) + 0.5f * (main.lo[2] + main.hi[2]) / lift;
+	for (int i = 0; i < 3; i++) {
+		// Half a pixel more: pixel centres lie inside.
+		v.radius[i] = 0.5f * (main.hi[i] - main.lo[i]) / tile + 0.5f / tile;
+	}
+	if (object.volume == Shaded_volume::tree && !e.crown.empty() && !e.body.empty()) {
+		v.trunk_radius = e.trunk_radius / tile;
+		v.trunk_top    = v.centre[2];    // Up into the crown.
+	}
+	v.kind                                = static_cast<int32_t>(object.volume);
+	buffers.object_volumes[object.id - 1] = v;
+}
+
+/*
+ *  The rounded geometry of a frame painted at (xoff, yoff) for the
+ *  current object, built once and cached.
+ */
+
+const Shaded_silhouette& Shaded_light::silhouette_for(Shape_frame& shape, int xoff, int yoff, int skip_from) {
+	if (silhouettes.size() > 2048) {
+		silhouettes.clear();
+	}
+	const Silhouette_key key{&shape,     skip_from,         static_cast<int>(object.volume), object.xpx,
+							 object.ypx, xoff - object.ox, yoff - object.oy};
+	auto [it, inserted] = silhouettes.try_emplace(key);
+	if (inserted) {
+		Shaded_cpu::build_silhouette(
+				shape.get_data(), shape.get_xleft(), shape.get_yabove(), shape.get_width(), shape.get_height(), skip_from,
+				object.volume, object.xpx, object.ypx, object.ax_px - static_cast<float>(key.du),
+				object.ay_px - static_cast<float>(key.dv), it->second);
+	}
+	return it->second;
 }
 
 void Shaded_light::shape_painted(int xoff, int yoff, Shape_frame& shape, bool translucent, int xfcnt) {
@@ -2849,7 +3279,14 @@ void Shaded_light::shape_painted(int xoff, int yoff, Shape_frame& shape, bool tr
 	switch (backend()) {
 	case Shaded_backend::gpu:    // backend() falls back to CPU.
 	case Shaded_backend::cpu:
-		if (shape.is_rle()) {
+		if (shape.is_rle() && object.volume != Shaded_volume::box) {
+			const int                skip = translucent ? 0xff - xfcnt : 0x100;
+			const Shaded_silhouette& sil  = silhouette_for(shape, xoff, yoff, skip);
+			Shaded_cpu::record_rounded(buffers, clip, object, sil, shape.get_data(), xoff, yoff, skip, rounded_pixels);
+			object_extent.body.add(sil.extent.body, 0.0f, 0.0f);
+			object_extent.crown.add(sil.extent.crown, 0.0f, 0.0f);
+			object_extent.trunk_radius = std::max(object_extent.trunk_radius, sil.extent.trunk_radius);
+		} else if (shape.is_rle()) {
 			Shaded_cpu::record_spans(buffers, clip, object, shape.get_data(), xoff, yoff, translucent ? 0xff - xfcnt : 0x100);
 		} else {    // An 8x8 flat tile, drawn up and left of its origin.
 			const Shaded_rect r = Intersect(Shaded_rect{xoff - c_tilesize, yoff - c_tilesize, c_tilesize, c_tilesize}, clip);
@@ -2924,6 +3361,7 @@ void Shaded_light::build_lut(uint8_t* lut) const {
 				col            = Rgb{grey, grey, grey};
 			}
 			break;
+		case Shaded_view::normals:
 		case Shaded_view::normal:
 		case Shaded_view::unlit:
 		case Shaded_view::count:
@@ -3037,17 +3475,43 @@ void Shaded_light::dump(Image_window8& win, int number, bool view, bool full) {
 	// Facts for checking the geometry: counts per face, and the avatar's
 	// pixels rebuilt into world positions, which should lie in its box.
 	long  faces[8] = {};
-	long  avatar_px = 0, avatar_clamped = 0;
+	long  avatar_px = 0, avatar_clamped = 0, avatar_rounded = 0;
 	long  box_px = 0, box_outside = 0;    // Unclamped object pixels.
 	long  clamped_px = 0;
+	long  rounded_px = 0, rounded_outside = 0;    // Rounded pixels, outside their fitted extent.
 	float lo[3] = {1e9f, 1e9f, 1e9f}, hi[3] = {-1e9f, -1e9f, -1e9f};
 	for (int y = 0; y < gh; y++) {
 		for (int x = 0; x < gw; x++) {
 			const int idx = buffers.index(x, y);
 			faces[buffers.facing_map[idx] & shaded_face_mask]++;
 			clamped_px += (buffers.facing_map[idx] & shaded_face_clamped) ? 1 : 0;
-			const uint16_t id = buffers.object_ids[idx];
-			if (id != shaded_id_none && id != shaded_id_overflow && !(buffers.facing_map[idx] & shaded_face_clamped)) {
+			const uint16_t id      = buffers.object_ids[idx];
+			const bool     rounded = (buffers.facing_map[idx] & shaded_face_mask) == shaded_face_rounded;
+			if (rounded && id != shaded_id_none && id != shaded_id_overflow && id <= object_extents.size()) {
+				// Rebuilt position must lie in the bounds of the object's
+				// fitted volume (body and crown) plus a quarter tile.
+				const Shaded_object_record&  o = buffers.objects[id - 1];
+				const Shaded_rounded_extent& e = object_extents[id - 1];
+				float                        w[3];
+				world_position(x, y, w[0], w[1], w[2]);
+				const float c[3] = {Shaded_wrap_delta(w[0] - (static_cast<float>(o.tx + 1) - 0.5f * static_cast<float>(o.xtiles)))
+											* c_tilesize,
+									Shaded_wrap_delta(w[1] - (static_cast<float>(o.ty + 1) - 0.5f * static_cast<float>(o.ytiles)))
+											* c_tilesize,
+									(w[2] - static_cast<float>(o.tz)) * (c_tilesize / 2)};
+				auto        in = [&c](const Shaded_rounded_extent::Range& r) {
+					constexpr float slack = 0.25f * c_tilesize;
+					for (int i = 0; i < 3; i++) {
+						if (r.empty() || c[i] < r.lo[i] - slack || c[i] > r.hi[i] + slack) {
+							return false;
+						}
+					}
+					return true;
+				};
+				rounded_px++;
+				rounded_outside += in(e.body) || in(e.crown) ? 0 : 1;
+			}
+			if (id != shaded_id_none && id != shaded_id_overflow && !rounded && !(buffers.facing_map[idx] & shaded_face_clamped)) {
 				// Rebuilt position must lie in the object's box (within
 				// half a pixel; world x/y wrap is ignored here).
 				const Shaded_object_record& o = buffers.objects[id - 1];
@@ -3069,6 +3533,10 @@ void Shaded_light::dump(Image_window8& win, int number, bool view, bool full) {
 				avatar_clamped++;
 				continue;
 			}
+			if ((buffers.facing_map[idx] & shaded_face_mask) == shaded_face_rounded) {
+				avatar_rounded++;
+				continue;
+			}
 			float w[3];
 			world_position(x, y, w[0], w[1], w[2]);
 			for (int i = 0; i < 3; i++) {
@@ -3088,26 +3556,30 @@ void Shaded_light::dump(Image_window8& win, int number, bool view, bool full) {
 		 << "pixels none " << faces[shaded_face_none] << " ground " << faces[shaded_face_ground] << " top "
 		 << faces[shaded_face_top] << " south " << faces[shaded_face_south] << " east " << faces[shaded_face_east] << "\n"
 		 << "object pixels (unclamped) " << box_px << " rebuilt outside their box " << box_outside << ", clamped "
-		 << clamped_px << "\n";
+		 << clamped_px << "\n"
+		 << "pixels rounded " << rounded_px << "\n"
+		 << "rounded pixels rebuilt outside their fitted volume " << rounded_outside << "\n";
 	if (main_actor_id != shaded_id_none && main_actor_id != shaded_id_overflow) {
 		const Shaded_object_record& a = buffers.objects[main_actor_id - 1];
 		// The box spans tiles (tx + 1 - xtiles .. tx + 1) and lifts tz .. tz + ztiles.
 		const float box_lo[3] = {static_cast<float>(a.tx + 1 - a.xtiles), static_cast<float>(a.ty + 1 - a.ytiles),
 								 static_cast<float>(a.tz)};
 		const float box_hi[3] = {static_cast<float>(a.tx + 1), static_cast<float>(a.ty + 1), static_cast<float>(a.tz + a.ztiles)};
-		bool        inside    = avatar_px > avatar_clamped;
+		bool        inside    = avatar_px > avatar_clamped + avatar_rounded;
 		for (int i = 0; i < 3; i++) {
 			// Pixel centres can sit half a pixel (1/16 tile) past the box.
 			inside = inside && lo[i] >= box_lo[i] - 0.07f && hi[i] <= box_hi[i] + 0.07f;
 		}
 		info << "avatar id " << main_actor_id << " shape " << a.shape << " frame " << a.frame << " tile " << a.tx << "," << a.ty
 			 << "," << a.tz << " box " << a.xtiles << "x" << a.ytiles << "x" << a.ztiles << "\n"
-			 << "avatar pixels " << avatar_px << " clamped " << avatar_clamped << "\n"
+			 << "avatar pixels " << avatar_px << " clamped " << avatar_clamped << " rounded " << avatar_rounded << "\n"
 			 << "avatar world x " << lo[0] << ".." << hi[0] << " y " << lo[1] << ".." << hi[1] << " z " << lo[2] << ".." << hi[2]
 			 << "\n"
 			 << "avatar box x " << box_lo[0] << ".." << box_hi[0] << " y " << box_lo[1] << ".." << box_hi[1] << " z "
 			 << box_lo[2] << ".." << box_hi[2] << "\n"
-			 << "avatar inside box " << (inside ? "yes" : "no") << "\n";
+			 << "avatar inside box "
+			 << (inside ? "yes" : (avatar_px == avatar_clamped + avatar_rounded && avatar_rounded > 0 ? "rounded (fitted volume check)" : "no"))
+			 << "\n";
 	} else {
 		info << "avatar not recorded\n";
 	}
