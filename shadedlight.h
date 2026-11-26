@@ -306,6 +306,7 @@ private:
 	double            paint_pixels    = 0;    // Total clip area.
 	double            all_paint_us    = 0;
 	double            all_record_us   = 0;
+	Clock::time_point last_report;
 	int               game_width      = 0;    // Of the last full paint.
 	int               game_height     = 0;
 	bool              warned_backend  = false;

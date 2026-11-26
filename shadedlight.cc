@@ -583,7 +583,11 @@ void Shaded_light::end_paint(Image_window8& win, bool full) {
 			paint_map_us += us;
 			record_us += paint_record_us;
 		}
-		if (paints % 500 == 0) {
+		// Every 5 s: Exult may quit without running static destructors.
+		if (paints == 1) {
+			last_report = stop;
+		} else if (stop - last_report >= std::chrono::seconds(5)) {
+			last_report = stop;
 			report_timing();
 		}
 	}
