@@ -72,6 +72,10 @@
 #include "touchui.h"
 #include "u7drag.h"
 #include "ucmachine.h"
+
+#include <chrono>
+#include <cstdlib>
+#include <thread>
 #include "utils.h"
 #include "verify.h"
 #include "version.h"
@@ -80,10 +84,12 @@
 #endif
 
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <iomanip>
 #include <sstream>
+#include <thread>
 
 #ifdef __GNUC__
 #	pragma GCC diagnostic push
@@ -213,6 +219,11 @@ static bool   arg_verify_files = false;    // Verify a game's files.
 
 static string arg_installmod  = {};
 static string arg_installdata = {};
+// Automated testing: run one usecode function after the game has started,
+// then quit after a timeout. See Autotest_tick().
+static string arg_autotest;                  // Usecode function number (decimal or 0x hex).
+static int    arg_autotest_delay   = 3000;   // ms after the first game frame.
+static int    arg_autotest_timeout = 60;     // seconds after the first game frame.
 
 static bool                 dragging      = false;    // Object or gump being moved.
 static bool                 dragged       = false;    // Flag for when obj. moved.
@@ -310,6 +321,9 @@ int main(int argc, char* argv[]) {
 	parameters.declare("--verify-files", &arg_verify_files, true);
 	parameters.declare("--installdata", &arg_installdata);
 	parameters.declare("--installmod", &arg_installmod);
+	parameters.declare("--autotest", &arg_autotest, "");
+	parameters.declare("--autotest-delay", &arg_autotest_delay, 3000);
+	parameters.declare("--autotest-timeout", &arg_autotest_timeout, 60);
 #if defined _WIN32
 	bool portable = false;
 	parameters.declare("-p", &portable, true);
@@ -1326,6 +1340,57 @@ static void Select_for_combo(
  *  Handle events until a flag is set.
  */
 
+/*
+ *  Automated testing (--autotest <function>): once the game is running, call
+ *  the usecode function after --autotest-delay ms, as a key binding's
+ *  call_usecode would, and quit cleanly after --autotest-timeout seconds.
+ *  The test reports through the usual console output (e.g. UI_error_message);
+ *  the caller decides pass or fail from it. Does nothing without --autotest.
+ */
+static void Autotest_tick(uint32 ticks) {
+	static int    function = -2;    // -2: not parsed yet; -1: disabled.
+	static uint32 start    = 0;
+	static bool   ran      = false;
+	if (function == -2) {
+		function = -1;
+		if (!arg_autotest.empty()) {
+			try {
+				function = std::stoi(arg_autotest, nullptr, 0);
+			} catch (const std::exception&) {
+				cerr << "AUTOTEST: bad function number '" << arg_autotest << "'" << endl;
+				quitting_time = QUIT_TIME_YES;
+				return;
+			}
+			start = ticks;
+			cout << "AUTOTEST: function 0x" << std::hex << function << std::dec << " in " << arg_autotest_delay
+				 << " ms, quit after " << arg_autotest_timeout << " s" << endl;
+			// A modal loop (a conversation, a gump) runs its own event loop,
+			// so this tick may never come back to quit. Ten seconds after
+			// the timeout, end the process from a watchdog thread instead.
+			const int hard_limit = arg_autotest_timeout + 10;
+			std::thread([hard_limit]() {
+				std::this_thread::sleep_for(std::chrono::seconds(hard_limit));
+				cerr << "AUTOTEST: still running after " << hard_limit
+					 << " s (blocked in a modal loop?), forcing exit" << endl;
+				std::_Exit(124);
+			}).detach();
+		}
+	}
+	if (function < 0) {
+		return;
+	}
+	if (!ran && ticks - start >= static_cast<uint32>(arg_autotest_delay)) {
+		ran = true;
+		cout << "AUTOTEST: running 0x" << std::hex << function << std::dec << endl;
+		gwin->get_usecode()->call_usecode(function, nullptr, Usecode_machine::double_click);
+		cout << "AUTOTEST: returned from 0x" << std::hex << function << std::dec << endl;
+	}
+	if (ticks - start >= static_cast<uint32>(arg_autotest_timeout) * 1000) {
+		cout << "AUTOTEST: timeout reached, quitting" << endl;
+		quitting_time = QUIT_TIME_YES;
+	}
+}
+
 static void Handle_events() {
 	uint32 last_repaint = 0;    // For insuring animation repaints.
 	uint32 last_rest    = 0;
@@ -1371,6 +1436,7 @@ static void Handle_events() {
 		}
 #endif
 		Game::set_ticks(ticks);
+		Autotest_tick(ticks);
 #ifdef DEBUG
 		if (last_fps == 0 || ticks >= last_fps + 10000) {
 			const double fps = (gwin->blits * 1000.0) / (ticks - last_fps);
