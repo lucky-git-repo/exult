@@ -273,12 +273,55 @@ void Shaded_cpu::build_fog_tables(
 	}
 }
 
+float Shaded_cpu::flash_grid_transmittance(const Shaded_grid_volume& vol, const Shaded_point& p, const Shaded_point& target) {
+	const Shaded_grid_ray ray{
+			{     p.x,      p.y,      p.z, 0.0f},
+			{target.x, target.y, target.z, 0.0f}
+	};
+	return Shaded_grid_cpu::trace(vol, ray, 0).transmittance;
+}
+
 /*
- *  Synthetic tests: a roofed room with a doorway, a closed room, and a
- *  hand-made square cloud frame; with the game's palettes, the fog tables.
+ *  The flash tables: each relit DAY colour mixed towards its LIGHTNING
+ *  colour in 7 steps, matched back to DAY as the remap tables are.
  */
 
-int Shaded_weather_selftest(const uint8_t* day768, const uint8_t* fog768) {
+void Shaded_cpu::build_flash_table(const uint8_t* day768, const uint8_t* lightning768, uint8_t* table) {
+	constexpr int first = 1;
+	constexpr int last  = shaded_last_lit_index;
+	float         day_lab[last + 1][3] = {};
+	for (int i = first; i <= last; i++) {
+		colour_lab(day768[3 * i], day768[3 * i + 1], day768[3 * i + 2], day_lab[i]);
+	}
+	for (int k = 0; k < shaded_flash_rows; k++) {
+		uint8_t* row = table + k * 256;
+		for (int i = 0; i < 256; i++) {
+			row[i] = static_cast<uint8_t>(i);
+		}
+		if (k == 0) {
+			continue;
+		}
+		const float t = static_cast<float>(k) / static_cast<float>(shaded_flash_rows - 1);
+		for (int i = first; i <= last; i++) {
+			int mixed[3];
+			for (int c = 0; c < 3; c++) {
+				const float v = static_cast<float>(day768[3 * i + c]) * (1.0f - t) + static_cast<float>(lightning768[3 * i + c]) * t;
+				mixed[c]      = static_cast<int>(std::lround(v));
+			}
+			float lab[3];
+			colour_lab(mixed[0], mixed[1], mixed[2], lab);
+			row[i] = static_cast<uint8_t>(nearest_colour_lab(day_lab, lab, first, last));
+		}
+	}
+}
+
+/*
+ *  Synthetic tests: a roofed room with a doorway, a closed room, and a
+ *  hand-made square cloud frame; with the game's palettes, the fog and
+ *  flash tables.
+ */
+
+int Shaded_weather_selftest(const uint8_t* day768, const uint8_t* fog768, const uint8_t* lightning768) {
 	int  passed   = 0;
 	int  failures = 0;
 	auto report   = [&](bool ok, const std::string& name, const std::string& detail) {
@@ -434,6 +477,55 @@ int Shaded_weather_selftest(const uint8_t* day768, const uint8_t* fog768) {
 		   "4 tiles=" + Fmt(f_near) + " 8=" + Fmt(f_mid) + " 30=" + Fmt(f_far));
 	report(f_high < f_mid && f_high > 0.0f && std::abs(f_wrap - f_mid) < 1e-4f, "fog-factor-height",
 		   "8 tiles at lift 4=" + Fmt(f_high) + " at 0=" + Fmt(f_mid) + " wrapped=" + Fmt(f_wrap));
+	// The flash's grid transmittance in room A, from the point (x, y) of
+	// the volume on the ground towards azimuth deg (0 = east, 90 = south)
+	// at the flash's elevation, up to the top of the grid.
+	auto flash_t = [&vol](float x, float y, float deg) {
+		constexpr float to_rad = 3.14159265f / 180.0f;
+		const float     e      = shaded_flash_elevation * to_rad;
+		const float     dx     = std::cos(e) * std::cos(deg * to_rad);
+		const float     dy     = std::cos(e) * std::sin(deg * to_rad);
+		const float     dz     = std::sin(e) / 0.5f;    // Lifts per tile of path (half a tile per lift).
+		const Shaded_point p{static_cast<float>(vol.origin_tx) + x, static_cast<float>(vol.origin_ty) + y, 0.0f};
+		const float        s = shaded_flash_top / dz;
+		return Shaded_cpu::flash_grid_transmittance(vol, p, Shaded_point{p.x + dx * s, p.y + dy * s, p.z + dz * s});
+	};
+	const float t_open    = flash_t(2.5f, 2.5f, 225.0f);    // North-west, over open ground.
+	const float t_roof    = flash_t(8.5f, 8.5f, 90.0f);
+	const float t_door    = flash_t(8.5f, 11.5f, 90.0f);    // Under the roof, out through the doorway.
+	const float t_back    = flash_t(8.5f, 11.5f, 270.0f);    // The same point, towards the roof.
+	const float t_outside = flash_t(8.5f, 13.5f, 90.0f);    // Just outside the doorway.
+	report(t_open == 1.0f, "flash-grid-open", "T=" + Fmt(t_open));
+	report(t_roof == 0.0f, "flash-grid-under-roof", "T=" + Fmt(t_roof));
+	report(t_door == 1.0f && t_back == 0.0f, "flash-grid-through-doorway",
+		   "T out=" + Fmt(t_door) + " T back under the roof=" + Fmt(t_back));
+	report(t_outside == 1.0f, "flash-grid-outside-doorway", "T=" + Fmt(t_outside));
+	if (day768 && lightning768) {
+		std::vector<uint8_t> table(shaded_flash_table_size);
+		Shaded_cpu::build_flash_table(day768, lightning768, table.data());
+		bool identity = true;
+		for (int k = 0; k < shaded_flash_rows; k++) {
+			for (int i = 0; i < 256; i++) {
+				const bool kept = k == 0 || i == 0 || i > shaded_last_lit_index;
+				identity        = identity && (!kept || table[static_cast<size_t>(k) * 256 + static_cast<size_t>(i)] == i);
+			}
+		}
+		// Row 7 is about as bright as LIGHTNING (relative to DAY).
+		auto luma = [](const uint8_t* pal, int i) {
+			return Shaded_luminance(pal[3 * i], pal[3 * i + 1], pal[3 * i + 2]);
+		};
+		double y_day = 0.0, y_row7 = 0.0, y_lightning = 0.0;
+		for (int i = 1; i <= shaded_last_lit_index; i++) {
+			y_day += luma(day768, i);
+			y_row7 += luma(day768, table[7 * 256 + i]);
+			y_lightning += luma(lightning768, i);
+		}
+		report(identity, "flash-table-identity", "row 0, index 0 and cycling colours unchanged");
+		report(y_row7 >= y_day && std::abs(y_row7 - y_lightning) <= 0.15 * y_lightning, "flash-table-brightens",
+			   "mean Y day " + Fmt(y_day / shaded_last_lit_index / 63.0, 1) + " row 7 "
+					   + Fmt(y_row7 / shaded_last_lit_index / 63.0, 1) + " lightning "
+					   + Fmt(y_lightning / shaded_last_lit_index / 63.0, 1));
+	}
 	if (day768 && fog768) {
 		std::vector<uint8_t> table(shaded_fog_table_size);
 		float                mix = 0.0f;

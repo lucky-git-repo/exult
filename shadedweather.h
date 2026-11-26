@@ -251,6 +251,15 @@ inline float Shaded_fog_factor(const Shaded_light_params& params, const Shaded_p
 	return std::clamp(open * params.fog_density * params.fog_mix * d * h, 0.0f, 7.0f / 8.0f);
 }
 
+// Lightning: flash tables of 8 rows of 256 (flash level 0..7), the
+// flash's elevation, and the lift its shadow traces end at (the top of
+// the occlusion grid).
+constexpr int   shaded_flash_rows       = 8;
+constexpr int   shaded_flash_table_size = shaded_flash_rows * 256;
+constexpr float shaded_flash_elevation  = 50.0f;    // Degrees.
+constexpr float shaded_flash_top        = static_cast<float>(shaded_grid_lifts);
+constexpr int   shaded_flash_dump_first = 100;    // Number of the first flash dump.
+
 namespace Shaded_cpu {
 	// The sky map of a grid volume (size_x x size_y): 255 for columns open
 	// to the sky, and under cover 255 * (1 - d / fade_tiles) (at least 0)
@@ -273,12 +282,23 @@ namespace Shaded_cpu {
 	// index 0 and the cycling colours are left as they are.
 	void build_fog_tables(
 			const uint8_t* day768, const uint8_t* fog768, float& fog_mix, float colour[3], uint8_t* table);
+	// The grid's transmittance for the flash from p to target (both in
+	// world tiles, tiles, lifts): a grid ray with its end cells skipped,
+	// as for the lamps.
+	float flash_grid_transmittance(const Shaded_grid_volume& vol, const Shaded_point& p, const Shaded_point& target);
+	// The flash tables (shaded_flash_table_size bytes) from DAY and the
+	// game's LIGHTNING palette (raw 6-bit colours): row k maps each relit
+	// DAY index i to the DAY colour nearest (CIELAB, lightness weighted 4)
+	// DAY[i] mixed k / 7 of the way to LIGHTNING[i]; row 0, index 0 and
+	// the cycling colours are left as they are.
+	void build_flash_table(const uint8_t* day768, const uint8_t* lightning768, uint8_t* table);
 }    // namespace Shaded_cpu
 
 // Synthetic tests over hand-built volumes; prints SHADED-WEATHER: TEST
 // lines.  With the game's DAY and FOG palettes (raw 6-bit colours), also
-// how well the fitted fog tables reproduce FOG.  Returns the number of
-// failures.
-int Shaded_weather_selftest(const uint8_t* day768 = nullptr, const uint8_t* fog768 = nullptr);
+// how well the fitted fog tables reproduce FOG, and with LIGHTNING the
+// flash table's identities.  Returns the number of failures.
+int Shaded_weather_selftest(
+		const uint8_t* day768 = nullptr, const uint8_t* fog768 = nullptr, const uint8_t* lightning768 = nullptr);
 
 #endif
