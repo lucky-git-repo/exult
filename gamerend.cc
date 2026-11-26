@@ -421,8 +421,10 @@ void Game_window::paint(
 			special_light = 0;
 			clock->set_palette();
 		}
-		// Set palette for lights.
-		clock->set_light_source(carried_light + light_sources, in_dungeon);
+		// Set palette for lights.  Shaded light lights the world itself, so
+		// the clock picks palettes with the lamps ignored.
+		clock->set_light_source(
+				Shaded_light::get().lighting_enabled() ? 0 : carried_light + light_sources, in_dungeon);
 	}
 
 	win->EndPaintIntoGuardBand();
