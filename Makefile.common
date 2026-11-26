@@ -35,6 +35,7 @@ MAIN_OBJS:=actions.o \
 	playscene.o \
 	readnpcs.o \
 	schedule.o \
+	shadedlight.o \
 	shapeid.o \
 	touchui.o \
 	tqueue.o \
