@@ -1177,6 +1177,21 @@ void Shaded_cpu::apply_light_rows(
 	}
 }
 
+void Shaded_cpu::apply_level_rows(
+		const Shaded_scene_buffers& buf, const Shaded_light_params& params, const Shaded_rect& r, int y0, int y1,
+		float level, const uint8_t* remap, unsigned char* frame) {
+	const int top_level = std::max(params.level_count - 1, 1);
+	for (int y = y0; y < y1; y++) {
+		const int row = buf.index(0, y);
+		for (int x = r.x; x < r.x + r.w; x++) {
+			// As light_rows quantises the level of unlit pixels.
+			const float threshold = params.dither ? Shaded_bayer4(x + params.scroll_px, y + params.scroll_py) : 0.5f;
+			const int   q         = static_cast<int>(std::floor(level * static_cast<float>(top_level) + threshold));
+			frame[row + x]        = remap[std::clamp(q, 0, top_level) * 256 + frame[row + x]];
+		}
+	}
+}
+
 float Shaded_cpu::palette_luminance(const uint8_t* pal768, const uint8_t* day768) {
 	long sum = 0, day = 0;
 	for (int i = 1; i <= shaded_last_lit_index; i++) {
@@ -1893,7 +1908,12 @@ bool Shaded_light::filter_palette(
 		remap.resize(shaded_remap_size);
 		displayed_pal.resize(768);
 		const uint8_t* refs[4] = {ref_pals[0].data(), ref_pals[1].data(), ref_pals[2].data(), ref_pals[3].data()};
-		Shaded_cpu::build_remap(ambient_pal.data(), refs, params, remap.data(), displayed_pal.data(), &ramp);
+		switch (backend()) {
+		case Shaded_backend::gpu:    // backend() falls back to CPU.
+		case Shaded_backend::cpu:
+			Shaded_cpu::build_remap(ambient_pal.data(), refs, params, remap.data(), displayed_pal.data(), &ramp);
+			break;
+		}
 		ambient_y    = Shaded_cpu::palette_luminance(ambient_pal.data(), refs[0]);
 		remap_slider = params.ambient;
 		remap_game   = key;
@@ -2691,6 +2711,30 @@ void Shaded_light::finish_paint(Image_window8& win, bool full) {
 		if (timing) {
 			report_timing();
 		}
+	}
+}
+
+/*
+ *  Relight a world paint made outside Game_window::paint (the crystal
+ *  ball's display_area, save thumbnails).  Nothing is recorded for it, so
+ *  every pixel gets the ambient level the displayed palette expects.
+ */
+
+void Shaded_light::relight_ambient(Image_window8& win, int x, int y, int w, int h) {
+	const auto view = static_cast<Shaded_view>(params.view);
+	if (!lit_active || view == Shaded_view::unlit || remap.size() != shaded_remap_size || !setup_buffers(win)) {
+		return;
+	}
+	const Shaded_rect r = Intersect(Shaded_rect{x, y, w, h}, buffers.bounds());
+	if (r.w <= 0 || r.h <= 0) {
+		return;
+	}
+	auto* frame = static_cast<unsigned char*>(win.get_draw_surface()->pixels);
+	switch (backend()) {
+	case Shaded_backend::gpu:    // backend() falls back to CPU.
+	case Shaded_backend::cpu:
+		Shaded_cpu::apply_level_rows(buffers, params, r, r.y, r.y + r.h, params.ambient_level, remap.data(), frame);
+		break;
 	}
 }
 

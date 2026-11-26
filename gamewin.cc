@@ -76,6 +76,7 @@
 #include "scene_layer.h"
 #include "schedule.h"
 #include "shadedgrid.h"
+#include "shadedlight.h"
 #include "spellbook.h"
 #include "touchui.h"
 #include "ucmachine.h"
@@ -3129,6 +3130,7 @@ bool Game_window::emulate_is_move_allowed(int tx, int ty) {
 unique_ptr<Shape_file> Game_window::create_mini_screenshot() {
 	set_all_dirty();
 	render->paint_map(0, 0, get_width(), get_height());
+	Shaded_light::get().relight_ambient(*win, 0, 0, get_width(), get_height());
 
 	unique_ptr<unsigned char[]> img(win->mini_screenshot());
 	unique_ptr<Shape_file>      sh;

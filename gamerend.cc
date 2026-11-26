@@ -62,6 +62,7 @@ void Game_window::paint_map_at_tile(
 	map->read_map_data();    // Gather in all objs., etc.
 	win->set_clip(x, y, w, h);
 	render->paint_map(0, 0, get_width(), get_height());
+	Shaded_light::get().relight_ambient(*win, x, y, w, h);
 	win->clear_clip();
 	scrolltx  = savescrolltx;
 	scrollty  = savescrollty;

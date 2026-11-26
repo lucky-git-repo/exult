@@ -662,6 +662,11 @@ namespace Shaded_cpu {
 	void apply_light_rows(
 			const Shaded_scene_buffers& buf, const Shaded_rect& r, int y0, int y1, const uint8_t* levels,
 			const uint8_t* remap, unsigned char* frame);
+	// Relight rows [y0, y1) of r of an 8-bit frame at one light level,
+	// dithered against world pixels as light_rows does for unlit pixels.
+	void apply_level_rows(
+			const Shaded_scene_buffers& buf, const Shaded_light_params& params, const Shaded_rect& r, int y0, int y1,
+			float level, const uint8_t* remap, unsigned char* frame);
 	// Mean luminance of indices 1..0xdf of a 6-bit palette, relative to day.
 	float palette_luminance(const uint8_t* pal768, const uint8_t* day768);
 	// Index in [first, last] of the colour of pal768 nearest (r, g, b).
@@ -741,6 +746,10 @@ public:
 	void end_paint(Image_window8& win, bool full);
 	// After the sprite effects: the light pass, debug views and dumps.
 	void finish_paint(Image_window8& win, bool full);
+	// After a world paint outside Game_window::paint (crystal balls, save
+	// thumbnails): while lighting is active, relight that rectangle (game
+	// pixels) at the ambient level, as the palette shown expects.
+	void relight_ambient(Image_window8& win, int x, int y, int w, int h);
 	// Around obj->paint() for a world object (ox, oy = its shape location).
 	void begin_object(const Game_object& obj, int ox, int oy);
 	void end_object();
@@ -865,37 +874,37 @@ private:
 	bool pending_teleport = false;
 	int  teleport_to[3]   = {0, 0, 0};
 	// Headless dumps (EXULT_SHADED_DUMP).
-	std::string      dump_dir;
-	std::vector<int> dump_at;    // ms after the first recorded full paint.
-	size_t           dump_next = 0;
-	bool             clock_started = false;
+	std::string       dump_dir;
+	std::vector<int>  dump_at;    // ms after the first recorded full paint.
+	size_t            dump_next     = 0;
+	bool              clock_started = false;
 	Clock::time_point first_paint;
 	// Timing (EXULT_SHADED_TIMING).
 	bool              timing = false;
 	Clock::time_point paint_start;
-	long long         full_paints     = 0;
-	double            paint_map_us    = 0;    // Totals over full paints.
-	double            record_us       = 0;
-	double            paint_record_us = 0;    // In the current paint.
-	long long         paints          = 0;    // All paints, full or not.
-	double            paint_pixels    = 0;    // Total clip area.
-	double            all_paint_us    = 0;
-	double            all_record_us   = 0;
-	long long         light_passes    = 0;    // Light pass, all and full paints.
-	long long         full_light_passes = 0;
-	double            all_light_us    = 0;
-	double            full_light_us   = 0;
-	long long         shadow_passes   = 0;    // Shadow pass, all and full paints.
+	long long         full_paints        = 0;
+	double            paint_map_us       = 0;    // Totals over full paints.
+	double            record_us          = 0;
+	double            paint_record_us    = 0;    // In the current paint.
+	long long         paints             = 0;    // All paints, full or not.
+	double            paint_pixels       = 0;    // Total clip area.
+	double            all_paint_us       = 0;
+	double            all_record_us      = 0;
+	long long         light_passes       = 0;    // Light pass, all and full paints.
+	long long         full_light_passes  = 0;
+	double            all_light_us       = 0;
+	double            full_light_us      = 0;
+	long long         shadow_passes      = 0;    // Shadow pass, all and full paints.
 	long long         full_shadow_passes = 0;
-	double            all_shadow_us   = 0;
-	double            full_shadow_us  = 0;
-	double            shadow_field_us = 0;    // Totals over all passes.
-	double            shadow_screen_us = 0;
-	long long         shadow_cache_hits = 0;
+	double            all_shadow_us      = 0;
+	double            full_shadow_us     = 0;
+	double            shadow_field_us    = 0;    // Totals over all passes.
+	double            shadow_screen_us   = 0;
+	long long         shadow_cache_hits  = 0;
 	Clock::time_point last_report;
-	int               game_width      = 0;    // Of the last full paint.
-	int               game_height     = 0;
-	bool              warned_backend  = false;
+	int               game_width     = 0;    // Of the last full paint.
+	int               game_height    = 0;
+	bool              warned_backend = false;
 
 	Shaded_light();
 	Shaded_backend     backend();
@@ -917,10 +926,10 @@ private:
 	void               check_shadows(const Shaded_rect& r);
 	bool               load_refs();
 	void               set_lit(bool on);
-	void           build_lut(uint8_t* lut) const;
-	void           dump(Image_window8& win, int number, bool view, bool full);
-	void           write_lighting_info(std::ostream& info);
-	void           report_timing() const;
+	void               build_lut(uint8_t* lut) const;
+	void               dump(Image_window8& win, int number, bool view, bool full);
+	void               write_lighting_info(std::ostream& info);
+	void               report_timing() const;
 };
 
 // Writes 8-bit RGB (or 16-bit big-endian grey) rows as a PNG; false on
