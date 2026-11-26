@@ -1274,9 +1274,14 @@ void Shaded_cpu::build_remap(
 		}
 	}
 	// B': DAY for the relit indices, A's own cycling colours, DAY's 0xff.
+	// The flame ranges take the first stop above ambient instead (CANDLE at
+	// night; DAY when no light palette is brighter than A), as the light
+	// palette Exult shows at night with a flame in view.
+	const uint8_t* glow = colours[2];
 	std::memcpy(displayed768, day, 768);
-	std::memcpy(displayed768 + 3 * (shaded_last_lit_index + 1), ambient768 + 3 * (shaded_last_lit_index + 1),
-				3 * (0xff - shaded_last_lit_index - 1));
+	for (int i = shaded_last_lit_index + 1; i < 0xff; i++) {
+		std::memcpy(displayed768 + 3 * i, (Shaded_glow_index(i) ? glow : ambient768) + 3 * i, 3);
+	}
 	params.ambient_level = ambient;
 	if (ramp) {
 		*ramp = stops;

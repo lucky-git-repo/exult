@@ -386,6 +386,15 @@ struct Shaded_ramp {
 constexpr int shaded_remap_size = shaded_light_levels * 256;
 // Last palette index the remap relights; 0xe0 on are the cycling colours.
 constexpr int shaded_last_lit_index = 0xdf;
+// The cycling ranges flames, embers and lava are drawn with (gamewin.cc
+// rotates 0xe8-0xef, 0xf8-0xfb and 0xfc-0xfe).  The night palettes turn
+// them green, and Exult only ever showed them through a light palette at
+// night, since a flame in view is a light.  B' takes them from the first
+// light stop above ambient.  The water and magic ranges (0xe0-0xe7,
+// 0xf0-0xf7) keep the ambient colours.
+constexpr bool Shaded_glow_index(int i) {
+	return (i >= 0xe8 && i <= 0xef) || (i >= 0xf8 && i <= 0xfe);
+}
 // Reference palettes of the ramp, in Shaded_cpu::build_remap's refs order.
 constexpr int shaded_ref_palettes[4] = {0, 7, 11, 12};    // DAY, CANDLE, SINGLE_LIGHT, MANY_LIGHTS.
 
