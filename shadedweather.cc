@@ -94,6 +94,29 @@ namespace {
 		}
 	}
 
+	// The relit DAY index nearest lab for the fog tables: CIELAB with
+	// lightness and hue weighted 4 (chroma 1).  Fog greys DAY's colours, and
+	// DAY has few greyed blues: with hue weighted 1 a fogged night sea
+	// matched dark magentas of the same lightness.
+	int Nearest_fog_colour(const float (*pal_lab)[3], const float lab[3]) {
+		int   best      = 1;
+		float best_dist = std::numeric_limits<float>::max();
+		const float c1  = std::sqrt(lab[1] * lab[1] + lab[2] * lab[2]);
+		for (int i = 1; i <= shaded_last_lit_index; i++) {
+			const float dl   = lab[0] - pal_lab[i][0];
+			const float da   = lab[1] - pal_lab[i][1];
+			const float db   = lab[2] - pal_lab[i][2];
+			const float dc   = c1 - std::sqrt(pal_lab[i][1] * pal_lab[i][1] + pal_lab[i][2] * pal_lab[i][2]);
+			const float dh2  = std::max(da * da + db * db - dc * dc, 0.0f);
+			const float dist = 4.0f * dl * dl + dc * dc + 4.0f * dh2;
+			if (dist < best_dist) {
+				best      = i;
+				best_dist = dist;
+			}
+		}
+		return best;
+	}
+
 	std::string Fmt(double v, int prec = 3) {
 		std::ostringstream out;
 		out << std::fixed << std::setprecision(prec) << v;
@@ -191,11 +214,71 @@ void Shaded_cpu::build_cloud_mask(
 }
 
 /*
- *  Synthetic tests: a roofed room with a doorway, a closed room, and a
- *  hand-made square cloud frame.
+ *  The fog tables: FOG as DAY mixed with a flat fog colour, fitted by
+ *  least squares, then every (amount, light) row matched back to DAY.
  */
 
-int Shaded_weather_selftest() {
+void Shaded_cpu::build_fog_tables(
+		const uint8_t* day768, const uint8_t* fog768, float& fog_mix, float colour[3], uint8_t* table) {
+	constexpr int first = 1;
+	constexpr int last  = shaded_last_lit_index;
+	constexpr int count = last - first + 1;
+	float         a_sum = 0.0f;
+	float         b[3];
+	for (int c = 0; c < 3; c++) {
+		double sx = 0, sy = 0, sxx = 0, sxy = 0;
+		for (int i = first; i <= last; i++) {
+			const double x = day768[3 * i + c];
+			const double y = fog768[3 * i + c];
+			sx += x;
+			sy += y;
+			sxx += x * x;
+			sxy += x * y;
+		}
+		const double var = sxx - sx * sx / count;
+		const double a   = var > 1e-9 ? (sxy - sx * sy / count) / var : 1.0;
+		b[c]             = static_cast<float>((sy - a * sx) / count);
+		a_sum += static_cast<float>(a);
+	}
+	fog_mix = std::clamp(1.0f - a_sum / 3.0f, 0.05f, 0.95f);
+	for (int c = 0; c < 3; c++) {
+		colour[c] = std::clamp(b[c] / fog_mix, 0.0f, 63.0f);
+	}
+	float day_lab[last + 1][3] = {};
+	for (int i = first; i <= last; i++) {
+		colour_lab(day768[3 * i], day768[3 * i + 1], day768[3 * i + 2], day_lab[i]);
+	}
+	for (int code = 0; code < shaded_fog_rows; code++) {
+		uint8_t* row = table + code * 256;
+		for (int i = 0; i < 256; i++) {
+			row[i] = static_cast<uint8_t>(i);
+		}
+		const int fk = code & 7;
+		const int fl = code >> 3;
+		if (fk == 0) {
+			continue;
+		}
+		const float amount = static_cast<float>(fk) / 8.0f;
+		const float light  = static_cast<float>(fl) / 7.0f;
+		for (int i = first; i <= last; i++) {
+			int mixed[3];
+			for (int c = 0; c < 3; c++) {
+				const float v = static_cast<float>(day768[3 * i + c]) * (1.0f - amount) + colour[c] * light * amount;
+				mixed[c]      = static_cast<int>(std::lround(v));
+			}
+			float lab[3];
+			colour_lab(mixed[0], mixed[1], mixed[2], lab);
+			row[i] = static_cast<uint8_t>(Nearest_fog_colour(day_lab, lab));
+		}
+	}
+}
+
+/*
+ *  Synthetic tests: a roofed room with a doorway, a closed room, and a
+ *  hand-made square cloud frame; with the game's palettes, the fog tables.
+ */
+
+int Shaded_weather_selftest(const uint8_t* day768, const uint8_t* fog768) {
 	int  passed   = 0;
 	int  failures = 0;
 	auto report   = [&](bool ok, const std::string& name, const std::string& detail) {
@@ -330,6 +413,78 @@ int Shaded_weather_selftest() {
 	const float twice = Shaded_cloud_cover(set, Shaded_point{100.0625f, 200.0625f, 0.0f});
 	report(under == 1.0f && away == 0.0f && twice == 1.0f, "cloud-cover",
 		   "under=" + Fmt(under) + " away=" + Fmt(away) + " two clouds=" + Fmt(twice));
+	// The fog factor round an Avatar at (100.5, 200.5) on the ground.
+	Shaded_light_params fp;
+	fp.fog_mix  = 0.5f;
+	fp.avatar_x = 100.5f;
+	fp.avatar_y = 200.5f;
+	auto fog_at = [&fp](float dx, float z, float open) {
+		return Shaded_fog_factor(fp, Shaded_point{fp.avatar_x + dx, fp.avatar_y, z}, open);
+	};
+	const float f_closed = fog_at(20.0f, 0.0f, 0.0f);
+	const float f_clear  = fog_at(fp.fog_clear - 0.25f, 0.0f, 1.0f);
+	const float f_near   = fog_at(4.0f, 0.0f, 1.0f);
+	const float f_mid    = fog_at(8.0f, 0.0f, 1.0f);
+	const float f_far    = fog_at(30.0f, 0.0f, 1.0f);
+	const float f_high   = fog_at(8.0f, 4.0f, 1.0f);
+	const float f_wrap   = Shaded_fog_factor(fp, Shaded_point{fp.avatar_x + 8.0f + c_num_tiles, fp.avatar_y, 0.0f}, 1.0f);
+	report(f_closed == 0.0f && f_clear == 0.0f, "fog-factor-clear",
+		   "covered=" + Fmt(f_closed) + " within fog_clear=" + Fmt(f_clear));
+	report(f_near > 0.0f && f_near < f_mid && f_mid < f_far && f_far <= fp.fog_mix, "fog-factor-distance",
+		   "4 tiles=" + Fmt(f_near) + " 8=" + Fmt(f_mid) + " 30=" + Fmt(f_far));
+	report(f_high < f_mid && f_high > 0.0f && std::abs(f_wrap - f_mid) < 1e-4f, "fog-factor-height",
+		   "8 tiles at lift 4=" + Fmt(f_high) + " at 0=" + Fmt(f_mid) + " wrapped=" + Fmt(f_wrap));
+	if (day768 && fog768) {
+		std::vector<uint8_t> table(shaded_fog_table_size);
+		float                mix = 0.0f;
+		float                colour[3];
+		Shaded_cpu::build_fog_tables(day768, fog768, mix, colour, table.data());
+		bool identity = true;
+		for (int code = 0; code < shaded_fog_rows; code++) {
+			for (int i = 0; i < 256; i++) {
+				const bool kept = (code & 7) == 0 || i == 0 || i > shaded_last_lit_index;
+				identity        = identity && (!kept || table[static_cast<size_t>(code) * 256 + static_cast<size_t>(i)] == i);
+			}
+		}
+		report(identity, "fog-table-identity", "rows fk=0, index 0 and cycling colours unchanged");
+		// The far fog on the ground (fk = round(8 w), full light) against
+		// FOG: the mix itself (before matching), the table's DAY colours,
+		// and the best DAY can do (each FOG colour's own nearest DAY colour;
+		// FOG's pale greys are not in DAY, so the table cannot beat it).
+		const int fk   = std::clamp(static_cast<int>(std::lround(8.0f * mix)), 1, 7);
+		const int code = fk + 8 * 7;
+		auto lab_of = [](const uint8_t* pal, int i, float lab[3]) {
+			Shaded_cpu::colour_lab(pal[3 * i], pal[3 * i + 1], pal[3 * i + 2], lab);
+		};
+		auto dist = [](const float a[3], const float b[3]) {
+			return std::sqrt((a[0] - b[0]) * (a[0] - b[0]) + (a[1] - b[1]) * (a[1] - b[1]) + (a[2] - b[2]) * (a[2] - b[2]));
+		};
+		float day_lab[shaded_last_lit_index + 1][3] = {};
+		for (int i = 1; i <= shaded_last_lit_index; i++) {
+			lab_of(day768, i, day_lab[i]);
+		}
+		double de_mix = 0.0, de_table = 0.0, de_best = 0.0;
+		for (int i = 1; i <= shaded_last_lit_index; i++) {
+			float want[3], mixed[3];
+			lab_of(fog768, i, want);
+			int m[3];
+			for (int c = 0; c < 3; c++) {
+				const float amount = static_cast<float>(fk) / 8.0f;
+				m[c] = static_cast<int>(std::lround(static_cast<float>(day768[3 * i + c]) * (1.0f - amount) + colour[c] * amount));
+			}
+			Shaded_cpu::colour_lab(m[0], m[1], m[2], mixed);
+			de_mix += dist(mixed, want);
+			de_table += dist(day_lab[table[static_cast<size_t>(code) * 256 + static_cast<size_t>(i)]], want);
+			de_best += dist(day_lab[Nearest_fog_colour(day_lab, want)], want);
+		}
+		de_mix /= shaded_last_lit_index;
+		de_table /= shaded_last_lit_index;
+		de_best /= shaded_last_lit_index;
+		report(de_mix < 6.0 && de_table < de_best + 1.0, "fog-table-fits-fog",
+			   "mean dE mix " + Fmt(de_mix, 2) + " table " + Fmt(de_table, 2) + " (FOG to nearest DAY " + Fmt(de_best, 2)
+					   + ") row fk " + std::to_string(fk) + " fl 7, mix " + Fmt(mix) + " colour " + Fmt(colour[0], 1) + ","
+					   + Fmt(colour[1], 1) + "," + Fmt(colour[2], 1));
+	}
 	std::cout << "SHADED-WEATHER: self-test " << passed << " passed, " << failures << " failed" << std::endl;
 	return failures;
 }

@@ -213,6 +213,44 @@ inline float Shaded_cloud_cover(const Shaded_weather_set& set, const Shaded_poin
 	return cover;
 }
 
+// Fog tables: 64 rows of 256, row code fk + 8 * fl (fog amount fk / 8, fog
+// light fl / 7, both 0..7).
+constexpr int shaded_fog_rows       = 64;
+constexpr int shaded_fog_table_size = shaded_fog_rows * 256;
+
+/*
+ *  How much fog is in front of point p (lifts above ground, tiles), as
+ *  open to the sky as open, 0..7/8: none within fog_clear tiles of the
+ *  Avatar, thickening with the horizontal distance beyond (fog_distance
+ *  tiles to 63 %) and thinning with height (fog_height lifts to 37 %),
+ *  reaching fog_mix (the FOG palette's share) far off on the ground.
+ */
+inline float Shaded_fog_factor(const Shaded_light_params& params, const Shaded_point& p, float open) {
+	if (open <= 0.0f || params.fog_density <= 0.0f) {
+		return 0.0f;
+	}
+	constexpr auto tiles = static_cast<float>(c_num_tiles);
+	// Shortest way round the wrapped world, in tiles.
+	auto wrap = [](float d) {
+		d = std::fmod(d, tiles);
+		if (d > tiles * 0.5f) {
+			d -= tiles;
+		} else if (d < -tiles * 0.5f) {
+			d += tiles;
+		}
+		return d;
+	};
+	const float dx   = wrap(p.x - params.avatar_x);
+	const float dy   = wrap(p.y - params.avatar_y);
+	const float past = std::sqrt(dx * dx + dy * dy) - params.fog_clear;
+	if (past <= 0.0f) {
+		return 0.0f;
+	}
+	const float d = 1.0f - std::exp(-past / std::max(params.fog_distance, 0.01f));
+	const float h = std::exp(-std::max(p.z, 0.0f) / std::max(params.fog_height, 0.01f));
+	return std::clamp(open * params.fog_density * params.fog_mix * d * h, 0.0f, 7.0f / 8.0f);
+}
+
 namespace Shaded_cpu {
 	// The sky map of a grid volume (size_x x size_y): 255 for columns open
 	// to the sky, and under cover 255 * (1 - d / fade_tiles) (at least 0)
@@ -226,10 +264,21 @@ namespace Shaded_cpu {
 	void build_cloud_mask(
 			const unsigned char* rle, int xleft, int yabove, int w, int h, int blur, std::vector<uint8_t>& data,
 			Shaded_cloud_mask& mask);
+	// The fog tables (shaded_fog_table_size bytes) from DAY and the game's
+	// FOG palette (raw 6-bit colours): FOG fitted per channel as
+	// a * DAY + b by least squares over the relit indices gives the fog's
+	// share fog_mix = 1 - mean a (0.05..0.95) and colour b / fog_mix.  Row
+	// fk + 8 * fl maps each relit DAY index to the DAY colour nearest (CIELAB,
+	// lightness and hue weighted 4) DAY * (1 - fk / 8) + colour * (fl / 7) * (fk / 8); rows with fk = 0,
+	// index 0 and the cycling colours are left as they are.
+	void build_fog_tables(
+			const uint8_t* day768, const uint8_t* fog768, float& fog_mix, float colour[3], uint8_t* table);
 }    // namespace Shaded_cpu
 
 // Synthetic tests over hand-built volumes; prints SHADED-WEATHER: TEST
-// lines.  Returns the number of failures.
-int Shaded_weather_selftest();
+// lines.  With the game's DAY and FOG palettes (raw 6-bit colours), also
+// how well the fitted fog tables reproduce FOG.  Returns the number of
+// failures.
+int Shaded_weather_selftest(const uint8_t* day768 = nullptr, const uint8_t* fog768 = nullptr);
 
 #endif

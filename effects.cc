@@ -1811,6 +1811,16 @@ void Fog_effect::handle_event(unsigned long curtime, uintptr udata) {
 }
 
 /**
+ *  Report the fog to shaded light once it has set in.
+ */
+
+void Fog_effect::add_shaded_weather(Shaded_weather_input& in) const {
+	if (!start) {
+		in.fog = true;
+	}
+}
+
+/**
  *  Create a cloud.
  */
 

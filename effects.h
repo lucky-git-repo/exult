@@ -354,6 +354,7 @@ public:
 	~Fog_effect() override;
 	// Execute when due.
 	void handle_event(unsigned long curtime, uintptr udata) override;
+	void add_shaded_weather(Shaded_weather_input& in) const override;
 };
 
 /*

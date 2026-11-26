@@ -1218,6 +1218,16 @@ private:
 	std::unordered_map<const Shape_frame*, int32_t> cloud_mask_cache;    // Frame to index in weather_set.masks.
 	int                  cloud_mask_blur = -1;    // Blur of the cached masks.
 	std::string          cloud_mask_game;
+	// The weather palettes (FOG, LIGHTNING; raw 6-bit, 768 each) and the
+	// fog tables fitted to FOG, built once per game.
+	std::vector<std::vector<uint8_t>> weather_pals;
+	std::string                       weather_refs_game;
+	std::vector<uint8_t>              fog_table;    // shaded_fog_table_size.
+	float                             fog_fit_mix   = 0.0f;
+	float                             fog_colour[3] = {0.0f, 0.0f, 0.0f};
+	// The Avatar's tile and the scroll tile of the last lit paint with fog.
+	std::array<int, 5>   fog_track{};
+	std::array<int, 5>   lit_fog_track{-1, -1, -1, -1, -1};
 	bool                 weather_test       = false;    // EXULT_SHADED_WEATHER_TEST.
 	bool                 weather_test_done  = false;
 	int                  dump_flash         = 0;    // EXULT_SHADED_DUMP_FLASH (lightning).
@@ -1275,6 +1285,7 @@ private:
 						  Shaded_light_row row, bool carried);
 	void               shift(int dx, int dy);
 	std::array<float, 23> slider_values() const;
+	bool               load_weather_refs();
 	bool               prepare_weather();
 	void               prepare_weather_pass();
 	int                light_pass(
