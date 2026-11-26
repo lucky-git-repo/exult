@@ -103,9 +103,10 @@
 :831/-1/4/60/255/214/170/-1/0
 #	Moongate.
 :864/-1/4/60/255/214/170/-1/0
-#	Hidden light circles (provisional, to be confirmed from the dump light
-#	list): even area light.  Names from Exult's docs/siitems.txt
-#	(336 "light source", 440 "light").
-:336/-1/8/35/255/240/210/0/1
-:440/-1/8/35/255/240/210/0/1
+#	Hidden light circles: none confirmed yet.  An area row (flags 1, e.g.
+#	radius 8, brightness 35) belongs only to a light whose object paints no
+#	pixels.  Shape 336 ("light source") is the unlit candle, not a light;
+#	shape 440 ("light") has the light flag but paints a visible 62x63 frame,
+#	so it keeps the formula default (b = 1) until a dump shows otherwise:
+#:440/-1/8/35/255/240/210/0/1
 %%endsection
